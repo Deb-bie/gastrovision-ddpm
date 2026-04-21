@@ -1,0 +1,97 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gastro-pipeline
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 172800   # 48 hours
+  template:
+    spec:
+      # OnFailure: Kubernetes restarts the container on crash.
+      # Domain adaptation and generation are both resume-aware from PVC checkpoints.
+      restartPolicy: OnFailure
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A6000
+                - NVIDIA-RTX-A6000
+      containers:
+      - name: gastro-pipeline
+        image: nvcr.io/nvidia/pytorch:23.10-py3
+        imagePullPolicy: IfNotPresent
+
+        env:
+        - name: REPO_PATH
+          value: /opt/repo/gastrovision-ddpm
+
+        command:
+        - "bash"
+        - "-c"
+        - |
+          echo "=== Checking GPU ==="
+          nvidia-smi
+
+          echo "=== Cloning / updating repo ==="
+          mkdir -p /opt/repo && cd /opt/repo
+          if [ -d "gastrovision-ddpm" ]; then
+            cd gastrovision-ddpm && git pull origin main
+          else
+            git clone --single-branch -b main \
+              https://github.com/Deb-bie/gastrovision-ddpm.git \
+              gastrovision-ddpm
+            cd gastrovision-ddpm
+          fi
+
+          echo "=== Installing dependencies ==="
+          pip install -q -r requirements.txt
+
+          echo "=== Starting pipeline ==="
+          python gastrovision_pipeline.py \
+            --data_dir            /data/gastrovision/data         \
+            --output_dir          /data/gastrovision               \
+            --image_root          gastrovision_raw/Gastrovision    \
+            --freeze_epochs       16                               \
+            --fine_tune_epochs    24                               \
+            --lora_rank           16                               \
+            --lora_alpha          32                               \
+            --sd_batch_size       2                                \
+            --sd_grad_accum       8                                \
+            --domain_adapt_steps  15000                            \
+            --samples_per_class   500                              \
+            --gen_steps           40                               \
+            --guidance_scale      7.0                              \
+            --gen_batch_size      2                                \
+            --models efficientnetv2_rw_s swin mobile hybrid_cnn_transformer hybrid_cnn_transformer_v2
+
+        volumeMounts:
+        - name: git-volume
+          mountPath: /opt/repo
+        - name: gastro-data-volume
+          mountPath: /data
+
+        resources:
+          limits:
+            memory: 120Gi
+            cpu: "16"
+            nvidia.com/gpu: "1"
+            ephemeral-storage: 50Gi
+          requests:
+            memory: 64Gi
+            cpu: "12"
+            nvidia.com/gpu: "1"
+            ephemeral-storage: 20Gi
+
+      volumes:
+      - name: git-volume
+        emptyDir: {}
+      - name: gastro-data-volume
+        persistentVolumeClaim:
+          claimName: gastro-data-pvc
