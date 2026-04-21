@@ -49,8 +49,8 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import (
     accuracy_score, classification_report, confusion_matrix,
     f1_score, precision_recall_fscore_support, roc_curve, auc,
-    calibration_curve,
 )
+from sklearn.calibration import calibration_curve
 from sklearn.preprocessing import label_binarize
 from scipy.linalg import sqrtm
 
