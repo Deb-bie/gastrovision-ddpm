@@ -86,9 +86,9 @@ except Exception:
 try:
     import shap
     SHAP_AVAILABLE = True
-except ImportError:
+except Exception:
     SHAP_AVAILABLE = False
-    print("SHAP not installed — SHAP analysis disabled.")
+    print("SHAP not available — SHAP analysis disabled.")
 
 from diffusers import (
     StableDiffusionPipeline,

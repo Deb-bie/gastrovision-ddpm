@@ -52,7 +52,13 @@ spec:
           fi
 
           echo "=== Installing dependencies ==="
-          pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null || true
+          # Remove ALL opencv variants — including the one baked into the base image
+          pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python \
+            opencv-contrib-python-headless 2>/dev/null || true
+          # Also remove shap pre-installed in image since it imports cv2 at module level
+          pip uninstall -y shap 2>/dev/null || true
+          # Install pinned opencv first so everything that depends on cv2 gets the right version
+          pip install -q opencv-python-headless==4.8.1.78
           pip install -q -r requirements.txt
 
           echo "=== Starting pipeline ==="
@@ -73,6 +79,7 @@ spec:
             --guidance_scale      7.0                              \
             --gen_batch_size      1                                \
             --models efficientnetv2_rw_s swin mobile hybrid_cnn_transformer_v2
+
 
         volumeMounts:
         - name: git-volume
