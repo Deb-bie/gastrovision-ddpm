@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gastro-data-pvc
+spec:
+  storageClassName: rook-cephfs-central
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 60Gi
