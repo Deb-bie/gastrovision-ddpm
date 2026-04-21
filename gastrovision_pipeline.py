@@ -117,11 +117,11 @@ def parse_args():
                    help="Output directory for checkpoints, results, logs")
     p.add_argument("--image_root",     default="gastrovision_raw/Gastrovision",
                    help="Subfolder under data_dir containing class folders")
-    p.add_argument("--train_csv",      default="splits/train.csv")
-    p.add_argument("--val_csv",        default="splits/val.csv")
-    p.add_argument("--test_csv",       default="splits/test.csv")
-    p.add_argument("--aug_train_csv",  default="splits/train_aug.csv")
-    p.add_argument("--synth_csv",      default="synthetic/synthetic_train.csv")
+    p.add_argument("--train_csv",      default="train.csv")
+    p.add_argument("--val_csv",        default="val.csv")
+    p.add_argument("--test_csv",       default="test.csv")
+    p.add_argument("--aug_train_csv",  default="train_aug.csv")
+    p.add_argument("--synth_csv",      default="synthetic_train.csv")
     p.add_argument("--synth_dir",      default="synthetic")
 
     # Classifier hyperparameters
@@ -283,7 +283,10 @@ NEGATIVE_PROMPT = (
 )
 
 CLASS_MAP = {
-    "Accessory tools": 0, "Angiectasia": 1, "Barretts esophagus": 2,
+    "Accessory tools": 0, "Angiectasia": 1,
+    "Barretts esophagus": 2,           # straight apostrophe variant
+    "Barrett\u2019s esophagus": 2,     # curly apostrophe — actual folder name on disk
+    "Barrett's esophagus": 2,          # straight apostrophe with apostrophe
     "Blood in lumen": 3, "Cecum": 4, "Colon diverticula": 5,
     "Colon polyps": 6, "Colorectal cancer": 7, "Duodenal bulb": 8,
     "Dyed-lifted-polyps": 9, "Dyed-resection-margins": 10, "Erythema": 11,
@@ -352,7 +355,7 @@ def create_splits():
             continue
         class_name = class_folder.name
         if class_name not in CLASS_MAP:
-            print(f"  WARNING: '{class_name}' not in CLASS_MAP — skipping")
+            print(f"  WARNING: {repr(class_name)} not in CLASS_MAP — skipping")
             continue
         class_id = CLASS_MAP[class_name]
         images   = list(class_folder.glob("*.png")) + list(class_folder.glob("*.jpg"))
