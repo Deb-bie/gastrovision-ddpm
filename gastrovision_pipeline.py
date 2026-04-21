@@ -79,9 +79,9 @@ try:
     from pytorch_grad_cam.utils.image import show_cam_on_image
     from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
     GRADCAM_AVAILABLE = True
-except ImportError:
+except Exception:
     GRADCAM_AVAILABLE = False
-    print("Grad-CAM not installed — XAI disabled.")
+    print("Grad-CAM not available — XAI disabled.")
 
 try:
     import shap
@@ -232,15 +232,29 @@ HPARAMS = {
     },
     "hybrid_cnn_transformer": {
         "lr": args.lr * 0.67, "freeze_epochs": max(1, args.freeze_epochs - 6),
-        "fine_tune_epochs": args.fine_tune_epochs + 6, "batch_size": args.batch_size,
+        "fine_tune_epochs": args.fine_tune_epochs + 6,
+        # V1 dual-branch needs more VRAM — cap at 8 on small GPUs
+        "batch_size": min(args.batch_size, 8),
         "gamma": args.gamma, "freeze_lr_mult": 5.0, "weight_decay": args.weight_decay,
     },
     "hybrid_cnn_transformer_v2": {
         "lr": args.lr * 0.67, "freeze_epochs": max(1, args.freeze_epochs - 8),
-        "fine_tune_epochs": args.fine_tune_epochs, "batch_size": args.batch_size,
+        "fine_tune_epochs": args.fine_tune_epochs,
+        # V2 sequential is lighter — cap at 16 on small GPUs
+        "batch_size": min(args.batch_size, 16),
         "gamma": args.gamma, "freeze_lr_mult": 5.0, "weight_decay": args.weight_decay,
     },
 }
+
+# On 11GB GPUs (RTX 2080 Ti) further cap all batch sizes
+if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory / 1e9 < 20:
+    for k in HPARAMS:
+        HPARAMS[k]["batch_size"] = min(HPARAMS[k]["batch_size"], 16)
+    # Swin base is large — 16 may OOM on 11GB, use 8
+    HPARAMS["swin"]["batch_size"] = 8
+    HPARAMS["hybrid_cnn_transformer"]["batch_size"] = 4    # V1 too large for 11GB at any useful batch
+    HPARAMS["hybrid_cnn_transformer_v2"]["batch_size"] = 8
+    print("  ⚠ RTX 2080 Ti detected — batch sizes capped for 11GB VRAM")
 
 
 # ==============================================================================
@@ -799,7 +813,7 @@ def domain_adapt_sd():
 
     print("Loading SD components...")
     vram_gb      = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
-    offload_cpu  = vram_gb < 45
+    offload_cpu  = vram_gb < 20    # covers 2080 Ti (11GB) and anything below A100
     print(f"  GPU VRAM: {vram_gb:.0f}GB  —  CPU offload: {offload_cpu}")
 
     tokenizer    = CLIPTokenizer.from_pretrained(args.sd_model_id, subfolder="tokenizer")
@@ -967,7 +981,7 @@ def generate_synthetic():
     # are moved to CPU when not in use, freeing VRAM for the UNet forward pass.
     # This adds ~10% latency per image but prevents OOM during generation.
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if vram_gb < 45:
+    if vram_gb < 20:
         try:
             pipe.enable_sequential_cpu_offload()
             print(f"  CPU offload enabled (GPU VRAM: {vram_gb:.0f}GB)")
