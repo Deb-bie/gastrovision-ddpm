@@ -450,7 +450,9 @@ class GastroVisionDataset(Dataset):
 
     def __getitem__(self, idx):
         rel  = self.imagepaths[idx]
-        path = (DATA_DIR / rel) if str(rel).startswith("synthetic/") else (IMAGE_ROOT_DIR / rel)
+        # Synthetic images are stored under OUTPUT_DIR/synthetic/
+        # Real images are stored under IMAGE_ROOT_DIR (which is DATA_DIR/gastrovision_raw/...)
+        path = (OUTPUT_DIR / rel) if str(rel).startswith("synthetic/") else (IMAGE_ROOT_DIR / rel)
         if not path.exists():
             raise FileNotFoundError(f"Image not found: {path}")
         return self.transform(Image.open(path).convert("RGB")), int(self.labels[idx])
@@ -1012,7 +1014,7 @@ def generate_synthetic():
 
         existing = sorted(cls_dir.glob("synth_*.png"))
         for p in existing:
-            rows.append({"image_path": str(p.relative_to(DATA_DIR)),
+            rows.append({"image_path": str(p.relative_to(OUTPUT_DIR)),
                          "label": int(cls), "class_name": cls_name, "source": "sd_ema"})
         if len(existing) >= args.samples_per_class:
             print(f"Class {cls}: {len(existing)} images already done — skipping"); continue
@@ -1036,7 +1038,7 @@ def generate_synthetic():
             for img in imgs:
                 img  = _postprocess(img.resize((args.img_size, args.img_size), Image.LANCZOS))
                 path = cls_dir / f"synth_{idx:05d}.png"; img.save(path)
-                rows.append({"image_path": str(path.relative_to(DATA_DIR)),
+                rows.append({"image_path": str(path.relative_to(OUTPUT_DIR)),
                              "label": int(cls), "class_name": cls_name, "source": "sd_ema"})
                 idx += 1
             if idx % 100 == 0 or idx >= args.samples_per_class:
@@ -1108,7 +1110,7 @@ def compute_fid(real_df, synth_df):
     real_pooled  = real_df[real_df["label"].isin(RARE_CLASSES)]
     synth_pooled = synth_df[synth_df["label"].isin(RARE_CLASSES)]
     fr = _fid_features(real_pooled,  IMAGE_ROOT_DIR, inc, hook_list)
-    fs = _fid_features(synth_pooled, DATA_DIR,       inc, hook_list)
+    fs = _fid_features(synth_pooled, OUTPUT_DIR,      inc, hook_list)
 
     h.remove(); del inc; torch.cuda.empty_cache()
 
