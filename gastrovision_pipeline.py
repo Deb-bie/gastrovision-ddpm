@@ -1607,18 +1607,72 @@ def main():
         train_df = pd.read_csv(train_csv)
         val_df   = pd.read_csv(val_csv)
         test_df  = pd.read_csv(test_csv)
-        # Update global NUM_CLASSES from saved label mapping
+
+        # Determine unique original labels (or fall back to 'label' column)
         if "original_label" in train_df.columns:
             unique_orig = sorted(train_df["original_label"].unique())
+            rare_orig = [c for c in unique_orig if len(train_df[train_df["original_label"] == c]) < 30]
         else:
+            # Assume the saved 'label' column already uses contiguous indices.
             unique_orig = sorted(train_df["label"].unique())
+            rare_orig = [c for c in unique_orig if len(train_df[train_df["label"] == c]) < 30]
+
+        # Build mapping from original label to contiguous index
         global LABEL_MAP, REV_LABEL_MAP
         LABEL_MAP = {orig: i for i, orig in enumerate(unique_orig)}
         REV_LABEL_MAP = {i: orig for orig, i in LABEL_MAP.items()}
         NUM_CLASSES = len(unique_orig)
-        counts   = train_df["label"].value_counts()
-        RARE_CLASSES = sorted([LABEL_MAP[c] for c in unique_orig if len(train_df[train_df["original_label"]==c]) < 30])
+
+        # Map rare original labels to contiguous indices
+        RARE_CLASSES = sorted([LABEL_MAP[c] for c in rare_orig])
+
         print(f"Loaded splits. RARE_CLASSES={RARE_CLASSES}")
+
+
+
+
+    # global NUM_CLASSES, RARE_CLASSES
+
+    # print("=" * 65)
+    # print("GastroVision DDPM Augmentation Pipeline (FIXED)")
+    # print("=" * 65)
+    # print(f"  data_dir:            {DATA_DIR}")
+    # print(f"  output_dir:          {OUTPUT_DIR}")
+    # print(f"  models:              {args.models}")
+    # print(f"  freeze_epochs:       {args.freeze_epochs}")
+    # print(f"  fine_tune_epochs:    {args.fine_tune_epochs}")
+    # print(f"  lora_rank:           {args.lora_rank}")
+    # print(f"  domain_adapt_steps:  {args.domain_adapt_steps}")
+    # print(f"  samples_per_class:   {args.samples_per_class}")
+    # print(f"  gen_steps:           {args.gen_steps}")
+    # print(f"  guidance_scale:      {args.guidance_scale}")
+    # print()
+
+    # # Step 1: Splits
+    # train_csv = SPLITS_DIR / args.train_csv
+    # val_csv   = SPLITS_DIR / args.val_csv
+    # test_csv  = SPLITS_DIR / args.test_csv
+
+    # if not train_csv.exists():
+    #     print("Creating splits...")
+    #     train_df, val_df, test_df, rare = create_splits()
+    #     RARE_CLASSES = rare
+    # else:
+    #     train_df = pd.read_csv(train_csv)
+    #     val_df   = pd.read_csv(val_csv)
+    #     test_df  = pd.read_csv(test_csv)
+    #     # Update global NUM_CLASSES from saved label mapping
+    #     if "original_label" in train_df.columns:
+    #         unique_orig = sorted(train_df["original_label"].unique())
+    #     else:
+    #         unique_orig = sorted(train_df["label"].unique())
+    #     global LABEL_MAP, REV_LABEL_MAP
+    #     LABEL_MAP = {orig: i for i, orig in enumerate(unique_orig)}
+    #     REV_LABEL_MAP = {i: orig for orig, i in LABEL_MAP.items()}
+    #     NUM_CLASSES = len(unique_orig)
+    #     counts   = train_df["label"].value_counts()
+    #     RARE_CLASSES = sorted([LABEL_MAP[c] for c in unique_orig if len(train_df[train_df["original_label"]==c]) < 30])
+    #     print(f"Loaded splits. RARE_CLASSES={RARE_CLASSES}")
 
     print(f"NUM_CLASSES={NUM_CLASSES}")
 
