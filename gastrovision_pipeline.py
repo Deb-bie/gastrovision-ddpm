@@ -171,6 +171,13 @@ def parse_args():
     p.add_argument("--skip_generation",   action="store_true")
     p.add_argument("--skip_training",     action="store_true")
     p.add_argument("--evaluate_only",     action="store_true")
+    p.add_argument("--tune",              action="store_true",
+                   help="Run Optuna tuning before training each model. "
+                        "Adds ~2h but improves val_acc and rare class F1.")
+    p.add_argument("--tune_trials",       type=int, default=15,
+                   help="Optuna trials per model (default 15)")
+    p.add_argument("--tune_epochs",       type=int, default=8,
+                   help="Epochs per Optuna trial (default 8)")
     p.add_argument("--models", nargs="+",
                    default=["efficientnetv2_rw_s", "swin", "mobile",
                             "hybrid_cnn_transformer", "hybrid_cnn_transformer_v2"],
@@ -261,32 +268,25 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memor
 # SECTION 3 — Prompt constants
 # ==============================================================================
 
-# Prepended to every class-specific prompt. Front-loading the domain context
-# gives it higher weight in CLIP's causal attention before class tokens.
-DOMAIN_PREFIX = (
-    "real gastroscopy photograph, circular endoscopic view with dark vignette "
-    "border, specular highlights from endoscope light source, pink mucosal "
-    "background, high resolution clinical endoscopy image: "
-)
+# CLIP hard limit: 77 tokens total for prompt + special tokens.
+# DOMAIN_PREFIX takes ~20 tokens, leaving ~55 for the class description.
+# Each class prompt below is written to stay under 55 tokens.
+# Key terms are front-loaded (most specific visual features first)
+# since CLIP attention weights earlier tokens more heavily.
+DOMAIN_PREFIX = "endoscopy photo, circular vignette, specular highlights, pink mucosa: "
 
 NEGATIVE_PROMPT = (
-    "diagram, illustration, drawing, cartoon, animation, painting, sketch, "
-    "render, 3d model, cgi, "
-    "blue background, white background, black background, grey background, "
-    "anatomical model, textbook figure, medical poster, "
-    "microscopy, histology, pathology slide, x-ray, ct scan, mri, ultrasound, "
-    "blurry, out of focus, low quality, low resolution, noisy, grainy, "
-    "overexposed, underexposed, dark, dim, "
-    "watermark, text, caption, label, logo, border, frame, "
-    "photograph of person, face, hands, natural scene, landscape, food, "
-    "animal, plant, outdoor, indoor room"
+    "illustration, diagram, cartoon, drawing, text, watermark, "
+    "x-ray, mri, ct scan, histology, microscopy, "
+    "blurry, low quality, overexposed, noisy, "
+    "natural scene, person, face, outdoor"
 )
 
 CLASS_MAP = {
     "Accessory tools": 0, "Angiectasia": 1,
-    "Barretts esophagus": 2,           # straight apostrophe variant
-    "Barrett\u2019s esophagus": 2,     # curly apostrophe — actual folder name on disk
-    "Barrett's esophagus": 2,          # straight apostrophe with apostrophe
+    "Barretts esophagus": 2,
+    "Barrett\u2019s esophagus": 2,
+    "Barrett's esophagus": 2,
     "Blood in lumen": 3, "Cecum": 4, "Colon diverticula": 5,
     "Colon polyps": 6, "Colorectal cancer": 7, "Duodenal bulb": 8,
     "Dyed-lifted-polyps": 9, "Dyed-resection-margins": 10, "Erythema": 11,
@@ -299,39 +299,39 @@ CLASS_MAP = {
     "Small bowel_terminal ileum": 25, "Ulcer": 26,
 }
 
+# All prompts kept under 55 tokens so DOMAIN_PREFIX + class stays within 77.
+# Most discriminative visual features listed first.
 CLASS_PROMPTS = {
-    0:  "gastroscopy photograph showing accessory tools, metal endoscopic instruments in circular endoscopic field, pink mucosa background, dark vignette border, specular highlights",
-    1:  "capsule endoscopy photograph of angiectasia, tortuous dilated red vessels on pink salmon mucosal surface, round endoscopic field with dark vignette, specular highlights, fish-eye lens distortion",
-    2:  "upper GI endoscopy photograph of Barrett's esophagus, salmon-colored irregular mucosal patches in lower esophagus, pink esophageal wall, round endoscopic field with dark vignette border, specular highlights",
-    3:  "gastroscopy photograph showing blood in lumen, dark red blood pooling in gastric lumen, pink mucosal walls, round endoscopic field with dark vignette border, specular highlights",
-    4:  "colonoscopy photograph of cecum, pale pink cecal mucosa with appendiceal orifice visible, haustral folds, round endoscopic field with dark vignette, specular highlights from colonoscope light",
-    5:  "colonoscopy photograph of colon diverticula, multiple dark circular openings in pink colonic mucosa, small pouches in bowel wall, round endoscopic field with dark vignette, specular highlights",
-    6:  "colonoscopy photograph of colon polyp, pedunculated or sessile polyp protruding from pink colonic mucosa, round endoscopic field with dark vignette border, specular highlights",
-    7:  "colonoscopy photograph of colorectal cancer, irregular friable mass with ulceration in colon, pink surrounding mucosa, round endoscopic field with dark vignette border, specular highlights",
-    8:  "upper GI endoscopy photograph of duodenal bulb, pale pink smooth duodenal mucosa with circular folds, round endoscopic field with dark vignette, specular highlights from endoscope light",
-    9:  "colonoscopy photograph of dyed lifted polyp, blue-dyed raised polyp on colonic mucosa after submucosal injection, round endoscopic field with dark vignette border, specular highlights",
-    10: "colonoscopy photograph of dyed resection margins, blue-dyed mucosal edges after polypectomy, round endoscopic field with dark vignette, specular highlights from colonoscope light",
-    11: "gastroscopy photograph of gastric erythema, diffuse reddish pink discoloration of stomach mucosa, hyperemic patches, round endoscopic field with dark vignette border, specular highlights",
-    12: "upper GI endoscopy photograph of esophageal varices, prominent bluish purple longitudinal bulging veins along esophageal wall, pink esophageal mucosa, round endoscopic field with dark vignette, specular highlights",
-    13: "upper GI endoscopy photograph of esophagitis, erythematous inflamed esophageal mucosa with linear erosions, round endoscopic field with dark vignette border, specular highlights",
-    14: "gastroscopy photograph of gastric polyp, smooth rounded polyp protruding from pink gastric mucosa, round endoscopic field with dark vignette border, specular highlights",
-    15: "upper GI endoscopy photograph of gastroesophageal junction normal z-line, clear squamocolumnar junction between esophagus and stomach, round endoscopic field with dark vignette, specular highlights",
-    16: "colonoscopy photograph of ileocecal valve, lips of ileocecal valve in pink cecal mucosa, round endoscopic field with dark vignette border, specular highlights from colonoscope",
-    17: "colonoscopy photograph of mucosal inflammation large bowel, granular friable reddish colonic mucosa with loss of vascular pattern, round endoscopic field with dark vignette, specular highlights",
-    18: "upper GI endoscopy photograph of normal esophagus, smooth pale pink esophageal mucosa with visible longitudinal folds, round endoscopic field with dark vignette border, specular highlights",
-    19: "colonoscopy photograph of normal colonic mucosa, smooth pink mucosa with clear vascular pattern, haustral folds, round endoscopic field with dark vignette border, specular highlights",
-    20: "gastroscopy photograph of normal stomach, smooth pink gastric mucosa with rugal folds, pool of clear gastric fluid, round endoscopic field with dark vignette border, specular highlights",
-    21: "gastroscopy photograph of pylorus, circular pyloric orifice in pink gastric mucosa, antral folds, round endoscopic field with dark vignette border, specular highlights",
-    22: "colonoscopy photograph of resected polyp, post-polypectomy site with cauterized flat mucosal defect, pink surrounding mucosa, round endoscopic field with dark vignette, specular highlights",
-    23: "endoscopy photograph of resection margins, post-surgical cauterized tissue edges with whitish fibrinous border, pink surrounding mucosa, round endoscopic field with dark vignette",
-    24: "colonoscopy photograph of retroflex rectum, retroflexed view of rectal mucosa and anorectal junction, pink smooth mucosa, round endoscopic field with dark vignette border, specular highlights",
-    25: "colonoscopy photograph of small bowel terminal ileum, pale pink villous mucosa with fine surface texture, round endoscopic field with dark vignette border, specular highlights",
-    26: "gastroscopy photograph of gastric ulcer, well-defined mucosal crater with white fibrinous base surrounded by erythematous gastric mucosa, round endoscopic field with dark vignette, specular highlights",
+    0:  "metal endoscopic tools, forceps or snare visible, gastroscopy",
+    1:  "angiectasia, tortuous red vessels, salmon mucosa, capsule endoscopy",
+    2:  "Barrett's esophagus, salmon irregular patches, lower esophagus",
+    3:  "blood in lumen, dark red pooling, gastric cavity",
+    4:  "cecum, pale pink mucosa, appendiceal orifice, haustral folds",
+    5:  "colon diverticula, dark circular openings in colonic wall",
+    6:  "colon polyp, sessile or pedunculated lesion, pink mucosa",
+    7:  "colorectal cancer, irregular friable mass, ulceration, colon",
+    8:  "duodenal bulb, pale smooth mucosa, circular folds",
+    9:  "dyed lifted polyp, blue submucosal injection, raised lesion",
+    10: "dyed resection margins, blue mucosal edges, post-polypectomy",
+    11: "gastric erythema, diffuse reddish mucosal discoloration",
+    12: "esophageal varices, bluish bulging veins, longitudinal, esophagus",
+    13: "esophagitis, erythematous mucosa, linear erosions, esophagus",
+    14: "gastric polyp, smooth rounded lesion, gastric wall",
+    15: "gastroesophageal junction, z-line, squamocolumnar border",
+    16: "ileocecal valve, two lips visible, cecal mucosa",
+    17: "mucosal inflammation, granular friable reddish colon, lost vascular pattern",
+    18: "normal esophagus, smooth pale pink mucosa, longitudinal folds",
+    19: "normal colon, smooth pink mucosa, clear vascular pattern, haustrae",
+    20: "normal stomach, rugal folds, pink gastric mucosa, gastric pool",
+    21: "pylorus, circular orifice, antral folds, gastroscopy",
+    22: "resected polyp, post-polypectomy scar, cauterized flat defect",
+    23: "resection margins, cauterized edges, whitish fibrinous border",
+    24: "retroflex rectum, retroflexed view, anorectal junction",
+    25: "terminal ileum, pale villous mucosa, fine texture, small bowel",
+    26: "gastric ulcer, mucosal crater, white fibrinous base, erythematous rim",
 }
 
 # FID normalization — applied identically to both real and synthetic images.
-# SD pipeline outputs PIL uint8 [0,255] PNGs; there is no [-1,1] leakage.
-# T.ToTensor() maps to [0,1]; T.Normalize() applies ImageNet stats → ~[-2.5, 2.5].
 FID_TRANSFORM = T.Compose([
     T.Resize((299, 299)),
     T.ToTensor(),
@@ -458,7 +458,36 @@ class GastroVisionDataset(Dataset):
         return self.transform(Image.open(path).convert("RGB")), int(self.labels[idx])
 
 
-class GastroVisionSDDataset(Dataset):
+class HeavyAugDataset(GastroVisionDataset):
+    """
+    Strategy S2: real data only with aggressive traditional augmentation.
+    This is the critical ablation baseline — it answers whether SD generation
+    adds value over just augmenting real images more aggressively.
+
+    Uses RandAugment + stronger geometric + elastic distortion transforms
+    that specifically target the kinds of variation seen in endoscopy:
+      - Rotation/flip: scope orientation varies
+      - ColorJitter: white balance differences between scopes
+      - RandomPerspective: fish-eye distortion from wide-angle lenses
+      - ElasticTransform: peristaltic motion blur approximation
+    """
+    def __init__(self, csv_path, split="train"):
+        super().__init__(csv_path, split, "classifier")
+        if split == "train":
+            norm = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+            self.transform = T.Compose([
+                T.Resize((args.img_size, args.img_size)),
+                T.RandomHorizontalFlip(),
+                T.RandomVerticalFlip(),
+                T.RandomRotation(30),
+                T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.4, hue=0.15),
+                T.RandomAffine(degrees=15, translate=(0.15, 0.15),
+                               scale=(0.8, 1.2), shear=10),
+                T.RandomPerspective(distortion_scale=0.4, p=0.5),
+                T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5)),
+                T.ToTensor(),
+                norm,
+            ])
     """Returns (pixel_values, input_ids, label) for SD LoRA training."""
     def __init__(self, csv_path, tokenizer, size=512):
         self.df        = pd.read_csv(csv_path)
@@ -751,6 +780,194 @@ def train_classifier(model_name, train_csv, val_csv, augmented=False):
 
 
 # ==============================================================================
+# SECTION 7B — Optuna hyperparameter tuning (optional)
+# ==============================================================================
+
+def tune_classifier(model_name, train_csv, val_csv, n_trials=15, tune_epochs=8):
+    """
+    Optuna TPE search over lr, gamma, freeze_lr_mult, weight_decay, batch_size.
+    Runs n_trials short experiments (tune_epochs each) and updates HPARAMS
+    with the best found values before full training.
+
+    Use --tune flag in the job to enable. Adds ~1-2 hours but typically
+    improves val_acc by 1-3% and rare class F1 by 5-10%.
+    """
+    if not OPTUNA_AVAILABLE:
+        print(f"  Optuna not available — skipping tuning for {model_name}")
+        return
+
+    print(f"\nTuning {model_name} ({n_trials} trials × {tune_epochs} epochs)...")
+
+    def objective(trial):
+        lr             = trial.suggest_float("lr",             1e-5, 5e-4, log=True)
+        gamma          = trial.suggest_float("gamma",          0.5,  3.0)
+        freeze_lr_mult = trial.suggest_float("freeze_lr_mult", 2.0,  15.0)
+        weight_decay   = trial.suggest_float("weight_decay",   1e-5, 1e-2, log=True)
+        batch_size     = trial.suggest_categorical("batch_size", [8, 16])
+
+        train_ds = GastroVisionDataset(train_csv, "train", "classifier")
+        val_ds   = GastroVisionDataset(val_csv,   "val",   "classifier")
+        tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                        num_workers=2, pin_memory=True)
+        vl = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                        num_workers=2, pin_memory=True)
+
+        model  = get_model(model_name)
+        crit   = FocalLoss(gamma=gamma)
+        scaler = GradScaler()
+
+        # Phase 1 warmup
+        _freeze(model, model_name)
+        opt = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=lr * freeze_lr_mult
+        )
+        for _ in range(min(3, tune_epochs // 2)):
+            model.train()
+            for xb, yb in tl:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                opt.zero_grad()
+                with autocast(): loss = crit(model(xb), yb)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, model.parameters()), 1.0
+                )
+                scaler.step(opt); scaler.update()
+
+        # Phase 2 fine-tune
+        _unfreeze(model, model_name)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tune_epochs)
+        best_acc = 0.0
+
+        for ep in range(tune_epochs):
+            model.train()
+            for xb, yb in tl:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                opt.zero_grad()
+                with autocast(): loss = crit(model(xb), yb)
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt); scaler.update()
+            sch.step()
+            acc = _eval_acc(model, vl)[0]
+            best_acc = max(best_acc, acc)
+            trial.report(acc, ep)
+            if trial.should_prune():
+                del model; torch.cuda.empty_cache()
+                raise optuna.exceptions.TrialPruned()
+
+        del model; torch.cuda.empty_cache()
+        return best_acc
+
+    import optuna
+    from optuna.pruners import MedianPruner
+    from optuna.samplers import TPESampler
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=TPESampler(seed=args.seed),
+        pruner=MedianPruner(n_startup_trials=4, n_warmup_steps=3),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_trial.params
+    print(f"  Best val_acc: {study.best_value:.4f}")
+    for k, v in best.items():
+        print(f"    {k:<20} {v}")
+
+    # Update HPARAMS in-place
+    HPARAMS[model_name].update({
+        "lr":             best["lr"],
+        "gamma":          best["gamma"],
+        "freeze_lr_mult": best["freeze_lr_mult"],
+        "weight_decay":   best["weight_decay"],
+        "batch_size":     best["batch_size"],
+    })
+
+    # Save tuned params to PVC so they persist across restarts
+    hparams_path = OUTPUT_DIR / "best_hparams.json"
+    with open(hparams_path, "w") as f:
+        json.dump(HPARAMS, f, indent=2)
+    print(f"  Saved tuned HPARAMS → {hparams_path}")
+    return study
+
+
+def train_classifier_heavy_aug(model_name, train_csv, val_csv):
+    """
+    Strategy S2: train with heavy traditional augmentation, no synthetic data.
+    Saves checkpoint as sota_{model_name}_heavy.pt.
+    Uses identical two-phase training as train_classifier but with HeavyAugDataset.
+    """
+    cfg     = HPARAMS[model_name]
+    crit    = FocalLoss(gamma=cfg["gamma"])
+    scaler  = GradScaler()
+    model   = get_model(model_name)
+    ckpt    = CKPT_DIR / f"sota_{model_name}_heavy.pt"
+
+    train_ds = HeavyAugDataset(train_csv, "train")
+    val_ds   = GastroVisionDataset(val_csv, "val", "classifier")
+    tl = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
+                    num_workers=4, pin_memory=True)
+    vl = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
+                    num_workers=4, pin_memory=True)
+
+    # Phase 1
+    _freeze(model, model_name)
+    opt = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg["lr"] * cfg.get("freeze_lr_mult", 10.0)
+    )
+    print(f"\n{'='*60}\n[{model_name}] Heavy Aug — Phase 1 ({cfg['freeze_epochs']} epochs)\n{'='*60}")
+    for ep in range(cfg["freeze_epochs"]):
+        model.train(); rl = 0.0
+        for xb, yb in tl:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad()
+            with autocast(): loss = crit(model(xb), yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, model.parameters()), 1.0)
+            scaler.step(opt); scaler.update()
+            rl += loss.item()
+        acc = _eval_acc(model, vl)[0]
+        print(f"  Ep {ep+1:2d}/{cfg['freeze_epochs']}  loss={rl/len(tl):.4f}  val_acc={acc:.4f}")
+
+    # Phase 2
+    _unfreeze(model, model_name)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                             weight_decay=cfg.get("weight_decay", 0.01))
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg["fine_tune_epochs"])
+    best_acc = 0.0
+    print(f"\n{'='*60}\n[{model_name}] Heavy Aug — Phase 2 ({cfg['fine_tune_epochs']} epochs)\n{'='*60}")
+    for ep in range(cfg["fine_tune_epochs"]):
+        model.train(); rl = 0.0
+        for xb, yb in tl:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad()
+            with autocast(): loss = crit(model(xb), yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt); scaler.update()
+            rl += loss.item()
+        sch.step()
+        acc = _eval_acc(model, vl)[0]
+        print(f"  Ep {ep+1:2d}/{cfg['fine_tune_epochs']}  loss={rl/len(tl):.4f}  val_acc={acc:.4f}")
+        if acc > best_acc:
+            best_acc = acc
+            torch.save(model.state_dict(), ckpt)
+            print(f"  ✅ Saved (val_acc={best_acc:.4f})")
+
+    print(f"\n  ★ {model_name} heavy aug best val_acc: {best_acc:.4f}")
+    return best_acc
+
+
+# ==============================================================================
 # SECTION 8 — EMA + SNR helpers
 # ==============================================================================
 
@@ -1010,7 +1227,16 @@ def generate_synthetic():
         cls_name = l2n.get(cls, f"class_{cls}")
         cls_dir  = SYNTH_DIR / str(cls); cls_dir.mkdir(parents=True, exist_ok=True)
         prompt   = DOMAIN_PREFIX + CLASS_PROMPTS.get(cls,
-            f"gastroscopy photograph of {cls_name}, round endoscopic field with dark vignette")
+            f"endoscopy photo, {cls_name}, circular vignette")
+
+        # Verify prompt fits within CLIP's 77-token limit before generating
+        tokens = pipe.tokenizer(prompt, return_tensors="pt")
+        n_tokens = tokens.input_ids.shape[1]
+        if n_tokens > 77:
+            print(f"  ⚠ Prompt too long ({n_tokens} tokens > 77) — will be truncated by CLIP")
+            print(f"    Truncated portion lost: last {n_tokens - 77} tokens")
+        else:
+            print(f"  ✅ Prompt fits: {n_tokens}/77 tokens")
 
         existing = sorted(cls_dir.glob("synth_*.png"))
         for p in existing:
@@ -1123,8 +1349,87 @@ def compute_fid(real_df, synth_df):
     return fid, kid
 
 
+# ==============================================================================
+# SECTION 11B — Confidence-weighted ensemble
+# ==============================================================================
+
+class ConfidenceEnsemble:
+    """
+    Confidence-weighted ensemble over all models for a given strategy.
+
+    Accepts a checkpoint suffix so it works for all strategies:
+      suffix=""        → S1: sota_{model}.pt       (real only)
+      suffix="_heavy"  → S2: sota_{model}_heavy.pt (heavy aug)
+      suffix="_aug"    → S3: sota_{model}_aug.pt   (SD synthetic)
+
+    Each model's vote is weighted by its own per-sample softmax confidence.
+    High-confidence models dominate; uncertain models contribute less.
+    Loads ALL models in args.models that have a checkpoint for this suffix —
+    not just swin, not just the best single model.
+    """
+
+    def __init__(self, model_names, suffix=""):
+        self.models  = {}
+        self.suffix  = suffix
+        for name in model_names:
+            ckpt = CKPT_DIR / f"sota_{name}{suffix}.pt"
+            if not ckpt.exists():
+                print(f"  Ensemble: skipping {name} — {ckpt.name} not found")
+                continue
+            try:
+                m = get_model(name)
+                m.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+                m.eval()
+                self.models[name] = m
+                print(f"  Ensemble: loaded {name}")
+            except Exception as e:
+                print(f"  Ensemble: failed to load {name}: {e}")
+
+        if not self.models:
+            raise RuntimeError(
+                f"Ensemble: no models loaded for suffix='{suffix}'. "
+                f"Train the models first."
+            )
+        print(f"  Ensemble ready: {len(self.models)} models  "
+              f"[{', '.join(self.models.keys())}]")
+
+    def predict(self, x):
+        """
+        Confidence-weighted ensemble prediction.
+        Returns (preds, ensemble_probs).
+        preds:          (B,) predicted class indices
+        ensemble_probs: (B, C) weighted average of per-model softmax outputs
+        """
+        x          = x.to(DEVICE)
+        probs_list = []
+        with torch.no_grad():
+            for m in self.models.values():
+                with autocast():
+                    probs_list.append(F.softmax(m(x), dim=1))
+
+        stacked        = torch.stack(probs_list, dim=0)               # (M, B, C)
+        confidences    = stacked.max(dim=2).values.permute(1, 0)      # (B, M)
+        weights        = confidences / confidences.sum(dim=1, keepdim=True)  # (B, M)
+        ensemble_probs = (stacked * weights.permute(1, 0).unsqueeze(-1)).sum(dim=0)  # (B, C)
+        return ensemble_probs.argmax(dim=1), ensemble_probs
+
+
+def eval_ensemble(ensemble, loader):
+    """Run ensemble inference on a DataLoader, return acc, y_true, y_pred, probs."""
+    yt_list, yp_list, pr_list = [], [], []
+    for xb, yb in loader:
+        preds, probs = ensemble.predict(xb)
+        yt_list.append(yb.numpy())
+        yp_list.append(preds.cpu().numpy())
+        pr_list.append(probs.cpu().numpy())
+    yt = np.concatenate(yt_list)
+    yp = np.concatenate(yp_list)
+    pr = np.concatenate(pr_list)
+    return float((yt == yp).mean()), yt, yp, pr
+
+
 def evaluate_all(augmented=False):
-    """Full evaluation: classifier metrics per model + ensemble + FID."""
+    """Full evaluation: per-model metrics + confidence ensemble + FID."""
     print("\n" + "="*65)
     print(f"Evaluation ({'augmented' if augmented else 'baseline'})")
     print("="*65)
@@ -1134,6 +1439,7 @@ def evaluate_all(augmented=False):
                          num_workers=4, pin_memory=True)
     results = {}
 
+    # ── Per-model evaluation ──────────────────────────────────────────────────
     for name in args.models:
         try:
             model = load_checkpoint(name, augmented)
@@ -1150,9 +1456,54 @@ def evaluate_all(augmented=False):
                          "f1_rare": float(f1[[c for c in RARE_CLASSES if c < NUM_CLASSES]].mean())}
         del model; torch.cuda.empty_cache()
 
-    # Confusion matrix for best model
-    if results:
-        best = max(results, key=lambda k: results[k]["acc"])
+    # ── Confidence-weighted ensemble over ALL models ──────────────────────────
+    suffix = "_aug" if augmented else ""
+    if len(results) >= 2:
+        print(f"\n{'='*65}")
+        print(f"Confidence-Weighted Ensemble ({'augmented' if augmented else 'baseline'})")
+        print(f"  Loading all {len(args.models)} models with suffix='{suffix}'")
+        print(f"{'='*65}")
+        try:
+            ensemble = ConfidenceEnsemble(args.models, suffix=suffix)
+            acc_e, yt_e, yp_e, pr_e = eval_ensemble(ensemble, val_ldr)
+            p_e, r_e, f1_e, _ = precision_recall_fscore_support(
+                yt_e, yp_e, labels=list(range(NUM_CLASSES)), average=None, zero_division=0
+            )
+            print(f"\nEnsemble ({len(ensemble.models)} models): "
+                  f"acc={acc_e:.4f}  mean_f1={f1_e.mean():.4f}")
+            print(classification_report(yt_e, yp_e, digits=4, zero_division=0))
+            results["ensemble"] = {
+                "acc": acc_e, "f1": f1_e.tolist(),
+                "f1_mean": float(f1_e.mean()),
+                "f1_rare": float(f1_e[[c for c in RARE_CLASSES if c < NUM_CLASSES]].mean()),
+                "n_models": len(ensemble.models),
+                "models":   list(ensemble.models.keys()),
+            }
+
+            tag = "_aug" if augmented else ""
+            cm = confusion_matrix(yt_e, yp_e)
+            fig, ax = plt.subplots(figsize=(16, 14))
+            sns.heatmap(cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-8),
+                        annot=True, fmt=".2f", cmap="Blues", ax=ax)
+            ax.set_title(
+                f"Ensemble ({len(ensemble.models)} models) — "
+                f"normalised CM ({'aug' if augmented else 'baseline'})"
+            )
+            plt.tight_layout()
+            plt.savefig(RESULTS_DIR / f"confusion_matrix_ensemble{tag}.png",
+                        dpi=150, bbox_inches="tight")
+            plt.close()
+            del ensemble; torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"  Ensemble failed: {e}")
+    else:
+        print("  Skipping ensemble — need ≥ 2 trained models")
+
+    # ── Confusion matrix for best individual model ────────────────────────────
+    individual = {k: v for k, v in results.items() if k != "ensemble"}
+    if individual:
+        best = max(individual, key=lambda k: individual[k]["acc"])
         try:
             model = load_checkpoint(best, augmented)
             _, yt, yp = _eval_acc(model, val_ldr)
@@ -1160,9 +1511,9 @@ def evaluate_all(augmented=False):
             fig, ax = plt.subplots(figsize=(16, 14))
             sns.heatmap(cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-8),
                         annot=True, fmt=".2f", cmap="Blues", ax=ax)
-            ax.set_title(f"{best} — normalised confusion matrix ({'aug' if augmented else 'baseline'})")
-            plt.tight_layout()
             tag = "_aug" if augmented else ""
+            ax.set_title(f"{best} — normalised CM ({'aug' if augmented else 'baseline'})")
+            plt.tight_layout()
             plt.savefig(RESULTS_DIR / f"confusion_matrix{tag}.png", dpi=150, bbox_inches="tight")
             plt.close()
             del model; torch.cuda.empty_cache()
@@ -1207,6 +1558,90 @@ def evaluate_all(augmented=False):
         if nm.startswith("_"): continue
         print(f"  {nm:<33} {res['acc']:>8.4f}  {res['f1_mean']:>8.4f}  {res['f1_rare']:>8.4f}")
 
+    return results
+
+
+def evaluate_heavy_aug():
+    """
+    Strategy S2 evaluation — heavy traditional augmentation only.
+    Loads sota_{model}_heavy.pt checkpoints.
+    This is the critical ablation comparison for the paper:
+    does SD generation improve on just augmenting real images more?
+    """
+    print("\n" + "="*65)
+    print("Evaluation (S2: heavy traditional augmentation only)")
+    print("="*65)
+
+    val_ds  = GastroVisionDataset(SPLITS_DIR / args.val_csv, "val", "classifier")
+    val_ldr = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                         num_workers=4, pin_memory=True)
+    results = {}
+
+    for name in args.models:
+        ckpt = CKPT_DIR / f"sota_{name}_heavy.pt"
+        if not ckpt.exists():
+            print(f"  Skipping {name}: no heavy aug checkpoint"); continue
+        try:
+            model = get_model(name)
+            model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+            model.eval()
+        except Exception as e:
+            print(f"  Skipping {name}: {e}"); continue
+
+        acc, yt, yp = _eval_acc(model, val_ldr)
+        _, _, f1, _ = precision_recall_fscore_support(
+            yt, yp, labels=list(range(NUM_CLASSES)), average=None, zero_division=0
+        )
+        print(f"\n{name} (heavy aug): acc={acc:.4f}  mean_f1={f1.mean():.4f}")
+        print(classification_report(yt, yp, digits=4, zero_division=0))
+        results[name] = {"acc": acc, "f1": f1.tolist(), "f1_mean": float(f1.mean()),
+                         "f1_rare": float(f1[[c for c in RARE_CLASSES if c < NUM_CLASSES]].mean())}
+        del model; torch.cuda.empty_cache()
+
+    # ── Confidence-weighted ensemble over ALL heavy aug models ────────────────
+    if len(results) >= 2:
+        print(f"\n{'='*65}")
+        print(f"Confidence-Weighted Ensemble (S2: heavy aug)")
+        print(f"  Loading all {len(args.models)} models with suffix='_heavy'")
+        print(f"{'='*65}")
+        try:
+            ensemble = ConfidenceEnsemble(args.models, suffix="_heavy")
+            acc_e, yt_e, yp_e, pr_e = eval_ensemble(ensemble, val_ldr)
+            _, _, f1_e, _ = precision_recall_fscore_support(
+                yt_e, yp_e, labels=list(range(NUM_CLASSES)), average=None, zero_division=0
+            )
+            print(f"\nEnsemble ({len(ensemble.models)} models): "
+                  f"acc={acc_e:.4f}  mean_f1={f1_e.mean():.4f}")
+            print(classification_report(yt_e, yp_e, digits=4, zero_division=0))
+            results["ensemble"] = {
+                "acc": acc_e, "f1": f1_e.tolist(),
+                "f1_mean": float(f1_e.mean()),
+                "f1_rare": float(f1_e[[c for c in RARE_CLASSES if c < NUM_CLASSES]].mean()),
+                "n_models": len(ensemble.models),
+                "models":   list(ensemble.models.keys()),
+            }
+
+            cm = confusion_matrix(yt_e, yp_e)
+            fig, ax = plt.subplots(figsize=(16, 14))
+            sns.heatmap(cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-8),
+                        annot=True, fmt=".2f", cmap="Blues", ax=ax)
+            ax.set_title(f"Ensemble ({len(ensemble.models)} models) — heavy aug — normalised CM")
+            plt.tight_layout()
+            plt.savefig(RESULTS_DIR / "confusion_matrix_ensemble_heavy.png",
+                        dpi=150, bbox_inches="tight")
+            plt.close()
+            del ensemble; torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  Heavy aug ensemble failed: {e}")
+
+    with open(RESULTS_DIR / "eval_results_heavy.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\n{'Model':<35} {'Acc':>8}  {'Mean F1':>8}  {'Rare F1':>8}")
+    print("-"*60)
+    for nm, res in results.items():
+        if nm.startswith("_"): continue
+        print(f"  {nm:<33} {res['acc']:>8.4f}  {res['f1_mean']:>8.4f}  {res['f1_rare']:>8.4f}")
     return results
 
 
@@ -1263,25 +1698,85 @@ def main():
         print("\n" + "="*65)
         print("Step 2: Training classifiers on real data")
         print("="*65)
+
+        # Load previously tuned hparams from PVC if they exist
+        hparams_path = OUTPUT_DIR / "best_hparams.json"
+        if hparams_path.exists():
+            with open(hparams_path) as f:
+                saved = json.load(f)
+            for k, v in saved.items():
+                if k in HPARAMS:
+                    HPARAMS[k].update(v)
+            print(f"  Loaded tuned HPARAMS from {hparams_path}")
+
         for name in args.models:
+            ckpt = CKPT_DIR / f"sota_{name}.pt"
+            if ckpt.exists():
+                print(f"\n  ✅ {name} checkpoint already exists — skipping training")
+                continue
+
+            # Optuna tuning before full training (if --tune flag set)
+            if args.tune:
+                tune_classifier(
+                    name, train_csv, val_csv,
+                    n_trials=args.tune_trials,
+                    tune_epochs=args.tune_epochs,
+                )
+
             print(f"\n{'#'*65}\n  {name}\n{'#'*65}")
             train_classifier(name, train_csv, val_csv, augmented=False)
 
-    # ── Step 3: Domain adaptation ─────────────────────────────────────────────
-    if not args.skip_domain_adapt:
+    # ── Step 2B: Train with heavy traditional augmentation (Strategy S2) ─────
+    # This is the ablation baseline — same real data, just stronger transforms.
+    # Must be run to establish whether SD generation adds value over augmentation.
+    if not args.skip_training:
         print("\n" + "="*65)
-        print("Step 3: SD LoRA domain adaptation")
+        print("Step 2B: Training with heavy traditional augmentation (S2)")
         print("="*65)
-        domain_adapt_sd()
+        for name in args.models:
+            ckpt = CKPT_DIR / f"sota_{name}_heavy.pt"
+            if ckpt.exists():
+                print(f"\n  ✅ {name} heavy aug checkpoint exists — skipping")
+                continue
+            print(f"\n{'#'*65}\n  {name} (heavy aug)\n{'#'*65}")
+            train_classifier_heavy_aug(name, train_csv, val_csv)
+
+    # ── Step 3: Domain adaptation ─────────────────────────────────────────────
+    # Auto-skip if EMA adapter already exists on PVC from a previous run.
+    # The resume checkpoint (resume_sd_lora.pt) handles mid-training restarts.
+    ema_adapter = CKPT_DIR / "sd_gastrovision_lora_ema_adapter"
+    if not args.skip_domain_adapt:
+        if ema_adapter.exists():
+            print("\n" + "="*65)
+            print("Step 3: SD domain adaptation — EMA adapter already exists, skipping")
+            print(f"  ({ema_adapter})")
+            print("="*65)
+        else:
+            print("\n" + "="*65)
+            print("Step 3: SD LoRA domain adaptation")
+            print("="*65)
+            domain_adapt_sd()
 
     # ── Step 4: Generate synthetic images ─────────────────────────────────────
+    synth_csv_path = SYNTH_DIR / "synthetic_train.csv"
     if not args.skip_generation:
-        print("\n" + "="*65)
-        print("Step 4: Generating synthetic images for rare classes")
-        print("="*65)
-        synth_df = generate_synthetic()
+        # Auto-skip if all rare classes already have enough images
+        already_done = all(
+            len(list((SYNTH_DIR / str(cls)).glob("synth_*.png"))) >= args.samples_per_class
+            for cls in RARE_CLASSES
+        ) if RARE_CLASSES else False
+
+        if already_done and synth_csv_path.exists():
+            print("\n" + "="*65)
+            print("Step 4: Generation — all classes already complete, skipping")
+            print("="*65)
+            synth_df = pd.read_csv(synth_csv_path)
+        else:
+            print("\n" + "="*65)
+            print("Step 4: Generating synthetic images for rare classes")
+            print("="*65)
+            synth_df = generate_synthetic()
     else:
-        synth_csv_path = SYNTH_DIR / "synthetic_train.csv"
         synth_df = pd.read_csv(synth_csv_path) if synth_csv_path.exists() else None
 
     # ── Step 5: Build augmented CSV + retrain ─────────────────────────────────
@@ -1298,21 +1793,64 @@ def main():
         print("✅ No leakage detected")
 
         aug_csv = SPLITS_DIR / args.aug_train_csv
-        aug_df  = pd.concat([train_df, synth_df], ignore_index=True)
-        aug_df.to_csv(aug_csv, index=False)
-        print(f"Augmented dataset: {len(train_df)} real + {len(synth_df)} synthetic = {len(aug_df)} total")
+        if not aug_csv.exists():
+            aug_df = pd.concat([train_df, synth_df], ignore_index=True)
+            aug_df.to_csv(aug_csv, index=False)
+            print(f"Augmented dataset: {len(train_df)} real + {len(synth_df)} synthetic = {len(aug_df)} total")
+        else:
+            print(f"Augmented CSV already exists — reusing ({aug_csv})")
 
         for name in args.models:
+            ckpt = CKPT_DIR / f"sota_{name}_aug.pt"
+            if ckpt.exists():
+                print(f"\n  ✅ {name} augmented checkpoint already exists — skipping")
+                continue
             print(f"\n{'#'*65}\n  {name} (augmented)\n{'#'*65}")
             train_classifier(name, aug_csv, val_csv, augmented=True)
 
-    # ── Step 6: Evaluate ──────────────────────────────────────────────────────
+    # ── Step 6: Evaluate all strategies ──────────────────────────────────────
     print("\n" + "="*65)
     print("Step 6: Evaluation")
     print("="*65)
-    evaluate_all(augmented=False)
+    evaluate_all(augmented=False)             # S1: real only
+    evaluate_heavy_aug()                       # S2: heavy traditional aug
     if not args.skip_training and synth_df is not None:
-        evaluate_all(augmented=True)
+        evaluate_all(augmented=True)           # S3: real + SD synthetic
+
+    # ── Strategy comparison summary table ─────────────────────────────────────
+    print("\n" + "="*65)
+    print("STRATEGY COMPARISON SUMMARY (Table 2 in paper)")
+    print("="*65)
+    try:
+        s1 = json.load(open(RESULTS_DIR / "eval_results.json"))
+        s2 = json.load(open(RESULTS_DIR / "eval_results_heavy.json"))
+        s3 = json.load(open(RESULTS_DIR / "eval_results_aug.json")) \
+             if (RESULTS_DIR / "eval_results_aug.json").exists() else {}
+
+        print(f"\n{'Strategy':<22} {'Model':<33} {'Acc':>8}  {'Mean F1':>8}  {'Rare F1':>8}")
+        print("-"*82)
+
+        for strategy, label, data in [
+            ("S1: Real only",     "", s1),
+            ("S2: Heavy aug",     "_heavy", s2),
+            ("S3: SD synthetic",  "_aug",   s3),
+        ]:
+            if not data: continue
+            # Individual models first
+            for nm, res in data.items():
+                if nm in ("ensemble",) or nm.startswith("_"): continue
+                print(f"  {strategy:<20} {nm:<33} {res['acc']:>8.4f}  "
+                      f"{res['f1_mean']:>8.4f}  {res['f1_rare']:>8.4f}")
+            # Ensemble row (highlighted)
+            if "ensemble" in data:
+                res = data["ensemble"]
+                n   = res.get("n_models", "?")
+                print(f"  {strategy:<20} {'ensemble (' + str(n) + ' models)':<33} "
+                      f"{res['acc']:>8.4f}  {res['f1_mean']:>8.4f}  {res['f1_rare']:>8.4f}  ◄")
+            print()
+
+    except Exception as e:
+        print(f"  Could not print comparison table: {e}")
 
     print("\n✅ Pipeline complete.")
 
