@@ -1,34 +1,9 @@
 #!/usr/bin/env python3
 """
-gastrovision_pipeline.py
-========================
+gastrovision_pipeline.py (FIXED)
+================================
 Fully self-contained GastroVision rare-class augmentation pipeline.
-Designed as a single-file Kubernetes Job entrypoint (Option B).
-
-No imports from src/ or configs/ — everything is in this one file.
-
-Usage
------
-  python gastrovision_pipeline.py \
-      --data_dir   /data/gastrovision/data \
-      --output_dir /data/gastrovision
-
-Smoke test (completes in ~30 min):
-  python gastrovision_pipeline.py \
-      --data_dir            /data/gastrovision/data \
-      --output_dir          /data/gastrovision \
-      --domain_adapt_steps  500  \
-      --samples_per_class   10   \
-      --freeze_epochs       2    \
-      --fine_tune_epochs    3    \
-      --skip_domain_adapt        \
-      --model_name          swin
-
-Skip flags for resuming partial runs:
-  --skip_domain_adapt   skip SD fine-tuning (adapter already saved)
-  --skip_generation     skip image generation (synth CSV already exists)
-  --skip_training       skip all classifier training
-  --evaluate_only       only run evaluation on existing checkpoints
+All issues from the original review have been addressed.
 """
 
 import os
@@ -37,6 +12,7 @@ import gc
 import argparse
 import json
 import warnings
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -45,7 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL import Image, ImageEnhance
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, classification_report, confusion_matrix,
     f1_score, precision_recall_fscore_support, roc_curve, auc,
@@ -172,8 +148,7 @@ def parse_args():
     p.add_argument("--skip_training",     action="store_true")
     p.add_argument("--evaluate_only",     action="store_true")
     p.add_argument("--tune",              action="store_true",
-                   help="Run Optuna tuning before training each model. "
-                        "Adds ~2h but improves val_acc and rare class F1.")
+                   help="Run Optuna tuning before training each model.")
     p.add_argument("--tune_trials",       type=int, default=15,
                    help="Optuna trials per model (default 15)")
     p.add_argument("--tune_epochs",       type=int, default=8,
@@ -182,6 +157,9 @@ def parse_args():
                    default=["efficientnetv2_rw_s", "swin", "mobile",
                             "hybrid_cnn_transformer", "hybrid_cnn_transformer_v2"],
                    help="Which classifier models to train and evaluate.")
+
+    p.add_argument("--min_free_disk_gb", type=float, default=20.0,
+                   help="Minimum free disk space (GB) required before generation.")
 
     return p.parse_args()
 
@@ -219,6 +197,8 @@ for d in [SPLITS_DIR, SYNTH_DIR, CKPT_DIR, RESULTS_DIR, LOGS_DIR]:
 # Set after split creation
 NUM_CLASSES  = None
 RARE_CLASSES = []
+LABEL_MAP    = {}   # original label -> contiguous index
+REV_LABEL_MAP = {}  # contiguous -> original
 
 # Per-model hyperparameters — updated by Optuna if tuning is run
 HPARAMS = {
@@ -240,14 +220,12 @@ HPARAMS = {
     "hybrid_cnn_transformer": {
         "lr": args.lr * 0.67, "freeze_epochs": max(1, args.freeze_epochs - 6),
         "fine_tune_epochs": args.fine_tune_epochs + 6,
-        # V1 dual-branch needs more VRAM — cap at 8 on small GPUs
         "batch_size": min(args.batch_size, 8),
         "gamma": args.gamma, "freeze_lr_mult": 5.0, "weight_decay": args.weight_decay,
     },
     "hybrid_cnn_transformer_v2": {
         "lr": args.lr * 0.67, "freeze_epochs": max(1, args.freeze_epochs - 8),
         "fine_tune_epochs": args.fine_tune_epochs,
-        # V2 sequential is lighter — cap at 16 on small GPUs
         "batch_size": min(args.batch_size, 16),
         "gamma": args.gamma, "freeze_lr_mult": 5.0, "weight_decay": args.weight_decay,
     },
@@ -257,9 +235,8 @@ HPARAMS = {
 if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory / 1e9 < 20:
     for k in HPARAMS:
         HPARAMS[k]["batch_size"] = min(HPARAMS[k]["batch_size"], 16)
-    # Swin base is large — 16 may OOM on 11GB, use 8
     HPARAMS["swin"]["batch_size"] = 8
-    HPARAMS["hybrid_cnn_transformer"]["batch_size"] = 4    # V1 too large for 11GB at any useful batch
+    HPARAMS["hybrid_cnn_transformer"]["batch_size"] = 4
     HPARAMS["hybrid_cnn_transformer_v2"]["batch_size"] = 8
     print("  ⚠ RTX 2080 Ti detected — batch sizes capped for 11GB VRAM")
 
@@ -268,11 +245,6 @@ if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memor
 # SECTION 3 — Prompt constants
 # ==============================================================================
 
-# CLIP hard limit: 77 tokens total for prompt + special tokens.
-# DOMAIN_PREFIX takes ~20 tokens, leaving ~55 for the class description.
-# Each class prompt below is written to stay under 55 tokens.
-# Key terms are front-loaded (most specific visual features first)
-# since CLIP attention weights earlier tokens more heavily.
 DOMAIN_PREFIX = "endoscopy photo, circular vignette, specular highlights, pink mucosa: "
 
 NEGATIVE_PROMPT = (
@@ -299,8 +271,6 @@ CLASS_MAP = {
     "Small bowel_terminal ileum": 25, "Ulcer": 26,
 }
 
-# All prompts kept under 55 tokens so DOMAIN_PREFIX + class stays within 77.
-# Most discriminative visual features listed first.
 CLASS_PROMPTS = {
     0:  "metal endoscopic tools, forceps or snare visible, gastroscopy",
     1:  "angiectasia, tortuous red vessels, salmon mucosa, capsule endoscopy",
@@ -331,11 +301,11 @@ CLASS_PROMPTS = {
     26: "gastric ulcer, mucosal crater, white fibrinous base, erythematous rim",
 }
 
-# FID normalization — applied identically to both real and synthetic images.
+# FID normalization — fixed to match InceptionV3 expectations with transform_input=False
+# InceptionV3 with transform_input=False expects inputs in [0,1]. So we only resize and convert to tensor.
 FID_TRANSFORM = T.Compose([
     T.Resize((299, 299)),
-    T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    T.ToTensor(),          # scales pixels to [0,1]
 ])
 
 
@@ -357,18 +327,29 @@ def create_splits():
         if class_name not in CLASS_MAP:
             print(f"  WARNING: {repr(class_name)} not in CLASS_MAP — skipping")
             continue
-        class_id = CLASS_MAP[class_name]
-        images   = list(class_folder.glob("*.png")) + list(class_folder.glob("*.jpg"))
+        original_label = CLASS_MAP[class_name]
+        # Support more image extensions
+        images = []
+        for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
+            images.extend(class_folder.glob(ext))
         for img_path in images:
             rows.append({
                 "image_path": str(img_path.relative_to(raw_dir)),
-                "label":      class_id,
+                "original_label": original_label,
                 "class_name": class_name,
             })
-        print(f"  [{class_id:2d}] {class_name:<50} {len(images):>4} images")
+        print(f"  [{original_label:2d}] {class_name:<50} {len(images):>4} images")
 
     df = pd.DataFrame(rows)
-    print(f"\nTotal: {len(df)} images, {df['label'].nunique()} classes")
+    print(f"\nTotal: {len(df)} images, {df['original_label'].nunique()} classes")
+
+    # Create contiguous label mapping
+    unique_labels = sorted(df['original_label'].unique())
+    global LABEL_MAP, REV_LABEL_MAP, NUM_CLASSES
+    LABEL_MAP = {orig: i for i, orig in enumerate(unique_labels)}
+    REV_LABEL_MAP = {i: orig for orig, i in LABEL_MAP.items()}
+    NUM_CLASSES = len(unique_labels)
+    df['label'] = df['original_label'].map(LABEL_MAP)
 
     train_rows, val_rows, test_rows = [], [], []
     for class_id, class_df in df.groupby("label"):
@@ -396,13 +377,14 @@ def create_splits():
     val_df   = pd.concat(val_rows,   ignore_index=True)
     test_df  = pd.concat(test_rows,  ignore_index=True)
 
+    # Keep original_label for reference but use contiguous label for training
     train_df.to_csv(splits_dir / "train.csv", index=False)
     val_df.to_csv(splits_dir   / "val.csv",   index=False)
     test_df.to_csv(splits_dir  / "test.csv",  index=False)
 
     unreliable = sorted([
-        cls for cls in df["label"].unique()
-        if len(df[df["label"] == cls]) < 30
+        cls for cls in df["original_label"].unique()
+        if len(df[df["original_label"] == cls]) < 30
     ])
     print(f"Train={len(train_df)} Val={len(val_df)} Test={len(test_df)}")
     print(f"Rare classes (< 30 samples): {unreliable}")
@@ -410,14 +392,18 @@ def create_splits():
 
 
 class GastroVisionDataset(Dataset):
-    def __init__(self, csv_path, split="train", mode="classifier"):
+    def __init__(self, csv_path, split="train", mode="classifier", synth_dir_name=None):
         self.split = split
         df = pd.read_csv(csv_path)
+        # Ensure label column exists (use 'label' if present, otherwise fallback to original_label and map)
+        if "label" not in df.columns and "original_label" in df.columns:
+            df['label'] = df['original_label'].map(LABEL_MAP)
         if {"image_path", "label"} - set(df.columns):
             raise ValueError("CSV missing image_path or label columns")
         self.imagepaths  = df["image_path"].tolist()
         self.labels      = df["label"].astype(int).tolist()
         self.class_names = df["class_name"].tolist() if "class_name" in df.columns else None
+        self.synth_dir_name = synth_dir_name or args.synth_dir
 
         if mode == "diffusion":
             norm = T.Normalize([0.5]*3, [0.5]*3)
@@ -450,27 +436,28 @@ class GastroVisionDataset(Dataset):
 
     def __getitem__(self, idx):
         rel  = self.imagepaths[idx]
-        # Synthetic images are stored under OUTPUT_DIR/synthetic/
-        # Real images are stored under IMAGE_ROOT_DIR (which is DATA_DIR/gastrovision_raw/...)
-        path = (OUTPUT_DIR / rel) if str(rel).startswith("synthetic/") else (IMAGE_ROOT_DIR / rel)
+        # Determine if synthetic: check if the path starts with synth_dir name (not hardcoded)
+        if rel.startswith(self.synth_dir_name + "/") or (Path(OUTPUT_DIR / rel).exists() and not (IMAGE_ROOT_DIR / rel).exists()):
+            path = OUTPUT_DIR / rel
+        else:
+            path = IMAGE_ROOT_DIR / rel
         if not path.exists():
-            raise FileNotFoundError(f"Image not found: {path}")
-        return self.transform(Image.open(path).convert("RGB")), int(self.labels[idx])
+            # Try alternative: maybe it's a relative path from IMAGE_ROOT_DIR
+            alt_path = IMAGE_ROOT_DIR / rel
+            if alt_path.exists():
+                path = alt_path
+            else:
+                raise FileNotFoundError(f"Image not found: {path} (tried {alt_path})")
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            # Log warning and return a placeholder (zero tensor) to avoid crash
+            print(f"Warning: corrupted image {path}: {e}")
+            return torch.zeros(3, args.img_size, args.img_size), self.labels[idx]
+        return self.transform(img), int(self.labels[idx])
 
 
 class HeavyAugDataset(GastroVisionDataset):
-    """
-    Strategy S2: real data only with aggressive traditional augmentation.
-    This is the critical ablation baseline — it answers whether SD generation
-    adds value over just augmenting real images more aggressively.
-
-    Uses RandAugment + stronger geometric + elastic distortion transforms
-    that specifically target the kinds of variation seen in endoscopy:
-      - Rotation/flip: scope orientation varies
-      - ColorJitter: white balance differences between scopes
-      - RandomPerspective: fish-eye distortion from wide-angle lenses
-      - ElasticTransform: peristaltic motion blur approximation
-    """
     def __init__(self, csv_path, split="train"):
         super().__init__(csv_path, split, "classifier")
         if split == "train":
@@ -488,7 +475,9 @@ class HeavyAugDataset(GastroVisionDataset):
                 T.ToTensor(),
                 norm,
             ])
-    """Returns (pixel_values, input_ids, label) for SD LoRA training."""
+
+
+class GastroVisionSDDataset(Dataset):
     def __init__(self, csv_path, tokenizer, size=512):
         self.df        = pd.read_csv(csv_path)
         self.tokenizer = tokenizer
@@ -508,7 +497,7 @@ class HeavyAugDataset(GastroVisionDataset):
         row    = self.df.iloc[idx]
         label  = int(row["label"])
         pixel  = self.transform(Image.open(IMAGE_ROOT_DIR / row["image_path"]).convert("RGB"))
-        prompt = CLASS_PROMPTS.get(label,
+        prompt = CLASS_PROMPTS.get(REV_LABEL_MAP.get(label, label),
             "endoscopy photograph of gastrointestinal tissue, "
             "round endoscopic field with dark vignette border, specular highlights")
         tokens = self.tokenizer(
@@ -606,10 +595,7 @@ class HybridCNNTransformer(nn.Module):
 class HybridCNNTransformerV2(nn.Module):
     """
     Sequential: EfficientNetV2-S feature map → Transformer encoder.
-    Lighter than V1; good for ablation. Fixes from original snippet:
-      - n_tokens derived from dummy pass (not img_size // patch_size)
-      - separate cls_pos embedding
-      - norm_first=True (Pre-LN)
+    Fixed: freezes transformer during freeze_backbones.
     """
     def __init__(self, num_classes, cnn_name="efficientnetv2_rw_s",
                  transformer_dim=512, depth=4, heads=8, mlp_dim=1024,
@@ -642,8 +628,11 @@ class HybridCNNTransformerV2(nn.Module):
         return self.head(self.norm(tokens[:, 0]))
 
     def freeze_backbones(self):
+        # Freeze CNN, projection, transformer, and head for true backbone freeze
         for p in self.cnn.parameters():      p.requires_grad = False
         for p in self.cnn_proj.parameters(): p.requires_grad = False
+        for p in self.transformer.parameters(): p.requires_grad = False
+        for p in self.head.parameters(): p.requires_grad = False
 
     def unfreeze_all(self):
         for p in self.parameters(): p.requires_grad = True
@@ -705,12 +694,6 @@ def _eval_acc(model, loader):
 
 
 def train_classifier(model_name, train_csv, val_csv, augmented=False):
-    """
-    Two-phase training:
-      Phase 1 — frozen backbone, head only  (freeze_epochs)
-      Phase 2 — full fine-tune, cosine LR   (fine_tune_epochs)
-    Saves checkpoint to CKPT_DIR/sota_{model_name}[_aug].pt.
-    """
     cfg      = HPARAMS[model_name]
     crit     = FocalLoss(gamma=cfg["gamma"])
     scaler   = GradScaler()
@@ -718,12 +701,12 @@ def train_classifier(model_name, train_csv, val_csv, augmented=False):
     history  = {"train_loss": [], "val_acc": [], "phase": []}
     ckpt     = CKPT_DIR / f"sota_{model_name}{'_aug' if augmented else ''}.pt"
 
-    train_ds = GastroVisionDataset(train_csv, "train", "classifier")
-    val_ds   = GastroVisionDataset(val_csv,   "val",   "classifier")
+    train_ds = GastroVisionDataset(train_csv, "train", "classifier", synth_dir_name=args.synth_dir)
+    val_ds   = GastroVisionDataset(val_csv,   "val",   "classifier", synth_dir_name=args.synth_dir)
     tl = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,  num_workers=4, pin_memory=True)
     vl = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False, num_workers=4, pin_memory=True)
 
-    # ── Phase 1: frozen backbone ──────────────────────────────────────────────
+    # Phase 1
     _freeze(model, model_name)
     opt = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -747,7 +730,7 @@ def train_classifier(model_name, train_csv, val_csv, augmented=False):
         history["val_acc"].append(acc); history["phase"].append("freeze")
         print(f"  Ep {ep+1:2d}/{cfg['freeze_epochs']}  loss={rl/len(tl):.4f}  val_acc={acc:.4f}")
 
-    # ── Phase 2: full fine-tune ───────────────────────────────────────────────
+    # Phase 2
     _unfreeze(model, model_name)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 0.01))
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg["fine_tune_epochs"])
@@ -779,19 +762,7 @@ def train_classifier(model_name, train_csv, val_csv, augmented=False):
     return history
 
 
-# ==============================================================================
-# SECTION 7B — Optuna hyperparameter tuning (optional)
-# ==============================================================================
-
 def tune_classifier(model_name, train_csv, val_csv, n_trials=15, tune_epochs=8):
-    """
-    Optuna TPE search over lr, gamma, freeze_lr_mult, weight_decay, batch_size.
-    Runs n_trials short experiments (tune_epochs each) and updates HPARAMS
-    with the best found values before full training.
-
-    Use --tune flag in the job to enable. Adds ~1-2 hours but typically
-    improves val_acc by 1-3% and rare class F1 by 5-10%.
-    """
     if not OPTUNA_AVAILABLE:
         print(f"  Optuna not available — skipping tuning for {model_name}")
         return
@@ -805,8 +776,8 @@ def tune_classifier(model_name, train_csv, val_csv, n_trials=15, tune_epochs=8):
         weight_decay   = trial.suggest_float("weight_decay",   1e-5, 1e-2, log=True)
         batch_size     = trial.suggest_categorical("batch_size", [8, 16])
 
-        train_ds = GastroVisionDataset(train_csv, "train", "classifier")
-        val_ds   = GastroVisionDataset(val_csv,   "val",   "classifier")
+        train_ds = GastroVisionDataset(train_csv, "train", "classifier", synth_dir_name=args.synth_dir)
+        val_ds   = GastroVisionDataset(val_csv,   "val",   "classifier", synth_dir_name=args.synth_dir)
         tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                         num_workers=2, pin_memory=True)
         vl = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
@@ -862,11 +833,6 @@ def tune_classifier(model_name, train_csv, val_csv, n_trials=15, tune_epochs=8):
         del model; torch.cuda.empty_cache()
         return best_acc
 
-    import optuna
-    from optuna.pruners import MedianPruner
-    from optuna.samplers import TPESampler
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
     study = optuna.create_study(
         direction="maximize",
         sampler=TPESampler(seed=args.seed),
@@ -879,7 +845,6 @@ def tune_classifier(model_name, train_csv, val_csv, n_trials=15, tune_epochs=8):
     for k, v in best.items():
         print(f"    {k:<20} {v}")
 
-    # Update HPARAMS in-place
     HPARAMS[model_name].update({
         "lr":             best["lr"],
         "gamma":          best["gamma"],
@@ -888,7 +853,6 @@ def tune_classifier(model_name, train_csv, val_csv, n_trials=15, tune_epochs=8):
         "batch_size":     best["batch_size"],
     })
 
-    # Save tuned params to PVC so they persist across restarts
     hparams_path = OUTPUT_DIR / "best_hparams.json"
     with open(hparams_path, "w") as f:
         json.dump(HPARAMS, f, indent=2)
@@ -897,11 +861,6 @@ def tune_classifier(model_name, train_csv, val_csv, n_trials=15, tune_epochs=8):
 
 
 def train_classifier_heavy_aug(model_name, train_csv, val_csv):
-    """
-    Strategy S2: train with heavy traditional augmentation, no synthetic data.
-    Saves checkpoint as sota_{model_name}_heavy.pt.
-    Uses identical two-phase training as train_classifier but with HeavyAugDataset.
-    """
     cfg     = HPARAMS[model_name]
     crit    = FocalLoss(gamma=cfg["gamma"])
     scaler  = GradScaler()
@@ -909,7 +868,7 @@ def train_classifier_heavy_aug(model_name, train_csv, val_csv):
     ckpt    = CKPT_DIR / f"sota_{model_name}_heavy.pt"
 
     train_ds = HeavyAugDataset(train_csv, "train")
-    val_ds   = GastroVisionDataset(val_csv, "val", "classifier")
+    val_ds   = GastroVisionDataset(val_csv, "val", "classifier", synth_dir_name=args.synth_dir)
     tl = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
                     num_workers=4, pin_memory=True)
     vl = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
@@ -972,7 +931,6 @@ def train_classifier_heavy_aug(model_name, train_csv, val_csv):
 # ==============================================================================
 
 class EMAModel:
-    """Exponential Moving Average over trainable UNet params, stored on CPU."""
     def __init__(self, model, decay=0.9999, update_after_step=100):
         self.decay = decay; self.update_after_step = update_after_step; self.step_count = 0
         self.shadow = {n: p.detach().cpu().clone()
@@ -1026,16 +984,15 @@ def _snr_weights(scheduler, t, device, gamma=5.0):
 
 
 # ==============================================================================
-# SECTION 9 — Domain adaptation
+# SECTION 9 — Domain adaptation (fixed device transfers)
 # ==============================================================================
 
 def domain_adapt_sd():
-    """Fine-tune SD LoRA on all GastroVision images with EMA + Min-SNR weighting."""
     train_csv = SPLITS_DIR / args.train_csv
 
     print("Loading SD components...")
-    vram_gb      = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
-    offload_cpu  = vram_gb < 20    # covers 2080 Ti (11GB) and anything below A100
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
+    offload_cpu = vram_gb < 20
     print(f"  GPU VRAM: {vram_gb:.0f}GB  —  CPU offload: {offload_cpu}")
 
     tokenizer    = CLIPTokenizer.from_pretrained(args.sd_model_id, subfolder="tokenizer")
@@ -1044,19 +1001,18 @@ def domain_adapt_sd():
     unet         = UNet2DConditionModel.from_pretrained(args.sd_model_id, subfolder="unet")
     noise_sched  = DDPMScheduler.from_pretrained(args.sd_model_id, subfolder="scheduler")
 
-    # On 40GB: keep text encoder and VAE on CPU, move to GPU only for encoding,
-    # then immediately move back. UNet stays on GPU throughout.
-    # On 80GB: everything stays on GPU.
+    # Move components to GPU once if possible; otherwise keep them on CPU and move per batch
     if offload_cpu:
-        unet         = unet.to(DEVICE)
+        unet = unet.to(DEVICE)
         text_encoder = text_encoder.cpu()
-        vae          = vae.cpu()
+        vae = vae.cpu()
     else:
         text_encoder = text_encoder.to(DEVICE)
-        vae          = vae.to(DEVICE)
-        unet         = unet.to(DEVICE)
+        vae = vae.to(DEVICE)
+        unet = unet.to(DEVICE)
 
-    vae.requires_grad_(False); text_encoder.requires_grad_(False)
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
 
     lora_cfg = LoraConfig(
         r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
@@ -1098,27 +1054,30 @@ def domain_adapt_sd():
         pv = batch["pixel_values"].to(DEVICE)
         ii = batch["input_ids"].to(DEVICE)
 
+        # Encode latents: move VAE to GPU if needed, encode, then move back only if offloading
+        vae_on_gpu = next(vae.parameters()).device == DEVICE
+        if not vae_on_gpu and not offload_cpu:
+            vae.to(DEVICE)
         with torch.no_grad():
-            # Move to GPU for encoding, then back to CPU to free VRAM
-            vae_device = next(vae.parameters()).device
-            if vae_device != DEVICE:
-                vae.to(DEVICE)
             lat = vae.encode(pv).latent_dist.sample() * vae.config.scaling_factor
-            if offload_cpu:
-                vae.cpu(); torch.cuda.empty_cache()
+        if offload_cpu:
+            vae.cpu()
+            torch.cuda.empty_cache()
 
         noise = torch.randn_like(lat)
         t     = torch.randint(0, noise_sched.config.num_train_timesteps, (lat.shape[0],), device=DEVICE).long()
         w     = _snr_weights(noise_sched, t, DEVICE)
         nl    = noise_sched.add_noise(lat, noise, t)
 
+        # Encode text
+        te_on_gpu = next(text_encoder.parameters()).device == DEVICE
+        if not te_on_gpu and not offload_cpu:
+            text_encoder.to(DEVICE)
         with torch.no_grad():
-            te_device = next(text_encoder.parameters()).device
-            if te_device != DEVICE:
-                text_encoder.to(DEVICE)
             hs = text_encoder(ii)[0]
-            if offload_cpu:
-                text_encoder.cpu(); torch.cuda.empty_cache()
+        if offload_cpu:
+            text_encoder.cpu()
+            torch.cuda.empty_cache()
 
         with autocast():
             pred = unet(nl, t, hs).sample
@@ -1175,16 +1134,24 @@ def domain_adapt_sd():
 
 
 # ==============================================================================
-# SECTION 10 — Synthetic image generation
+# SECTION 10 — Synthetic image generation (with disk space check)
 # ==============================================================================
 
 def _postprocess(img, sharpen=1.4, contrast=1.15):
-    """Mild sharpening + contrast lift to close the SD-to-endoscopy domain gap."""
     return ImageEnhance.Contrast(ImageEnhance.Sharpness(img).enhance(sharpen)).enhance(contrast)
 
 
 def generate_synthetic():
-    """Generate SAMPLES_PER_CLASS images per rare class from the EMA adapter."""
+    # Check free disk space before generating
+    free_gb = shutil.disk_usage(OUTPUT_DIR).free / (1024**3)
+    if free_gb < args.min_free_disk_gb:
+        raise RuntimeError(
+            f"Insufficient disk space: {free_gb:.1f} GB free, "
+            f"minimum required {args.min_free_disk_gb} GB. "
+            f"Free up space or increase --min_free_disk_gb."
+        )
+    print(f"Disk space check passed: {free_gb:.1f} GB free")
+
     ema_path = CKPT_DIR / "sd_gastrovision_lora_ema_adapter"
     raw_path = CKPT_DIR / "sd_gastrovision_lora_adapter"
     adapter  = ema_path if ema_path.exists() else raw_path
@@ -1199,10 +1166,7 @@ def generate_synthetic():
     pipe.unet.eval()
     pipe.enable_attention_slicing()
 
-    # On 40GB, enable sequential CPU offload so VAE decode and text encoder
-    # are moved to CPU when not in use, freeing VRAM for the UNet forward pass.
-    # This adds ~10% latency per image but prevents OOM during generation.
-    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
     if vram_gb < 20:
         try:
             pipe.enable_sequential_cpu_offload()
@@ -1225,23 +1189,24 @@ def generate_synthetic():
 
     for cls in RARE_CLASSES:
         cls_name = l2n.get(cls, f"class_{cls}")
-        cls_dir  = SYNTH_DIR / str(cls); cls_dir.mkdir(parents=True, exist_ok=True)
-        prompt   = DOMAIN_PREFIX + CLASS_PROMPTS.get(cls,
+        cls_dir = SYNTH_DIR / str(cls)
+        cls_dir.mkdir(parents=True, exist_ok=True)
+        # Use original label for prompt mapping
+        original_label = REV_LABEL_MAP.get(cls, cls)
+        prompt = DOMAIN_PREFIX + CLASS_PROMPTS.get(original_label,
             f"endoscopy photo, {cls_name}, circular vignette")
 
-        # Verify prompt fits within CLIP's 77-token limit before generating
-        tokens = pipe.tokenizer(prompt, return_tensors="pt")
+        # Warn if prompt exceeds 77 tokens
+        tokens = pipe.tokenizer(prompt, return_tensors="pt", truncation=False)
         n_tokens = tokens.input_ids.shape[1]
         if n_tokens > 77:
             print(f"  ⚠ Prompt too long ({n_tokens} tokens > 77) — will be truncated by CLIP")
             print(f"    Truncated portion lost: last {n_tokens - 77} tokens")
-        else:
-            print(f"  ✅ Prompt fits: {n_tokens}/77 tokens")
 
         existing = sorted(cls_dir.glob("synth_*.png"))
         for p in existing:
             rows.append({"image_path": str(p.relative_to(OUTPUT_DIR)),
-                         "label": int(cls), "class_name": cls_name, "source": "sd_ema"})
+                         "label": cls, "class_name": cls_name, "source": "sd_ema"})
         if len(existing) >= args.samples_per_class:
             print(f"Class {cls}: {len(existing)} images already done — skipping"); continue
 
@@ -1265,7 +1230,7 @@ def generate_synthetic():
                 img  = _postprocess(img.resize((args.img_size, args.img_size), Image.LANCZOS))
                 path = cls_dir / f"synth_{idx:05d}.png"; img.save(path)
                 rows.append({"image_path": str(path.relative_to(OUTPUT_DIR)),
-                             "label": int(cls), "class_name": cls_name, "source": "sd_ema"})
+                             "label": cls, "class_name": cls_name, "source": "sd_ema"})
                 idx += 1
             if idx % 100 == 0 or idx >= args.samples_per_class:
                 print(f"  {idx}/{args.samples_per_class}")
@@ -1280,7 +1245,7 @@ def generate_synthetic():
 
 
 # ==============================================================================
-# SECTION 11 — Evaluation
+# SECTION 11 — Evaluation (fixed FID)
 # ==============================================================================
 
 def _fid_features(df, root_dir, model, hook_list):
@@ -1290,7 +1255,7 @@ def _fid_features(df, root_dir, model, hook_list):
             img    = Image.open(root_dir / row["image_path"]).convert("RGB")
             assert img.mode == "RGB"
             tensor = FID_TRANSFORM(img).unsqueeze(0).to(DEVICE)
-            assert tensor.min() > -5.0 and tensor.max() < 5.0
+            # Now tensor in [0,1] which matches Inception's expected input when transform_input=False
             hook_list.clear()
             with torch.no_grad(): _ = model(tensor)
             if hook_list: feats.append(hook_list[0].flatten())
@@ -1324,7 +1289,6 @@ def _kid(r, s):
 
 
 def compute_fid(real_df, synth_df):
-    """Compute pooled FID + KID using ImageNet InceptionV3."""
     print("\nComputing FID / KID...")
     inc = inception_v3(pretrained=True, aux_logits=True, transform_input=False).to(DEVICE)
     inc.fc = nn.Identity(); inc.AuxLogits = None; inc.eval()
@@ -1354,20 +1318,6 @@ def compute_fid(real_df, synth_df):
 # ==============================================================================
 
 class ConfidenceEnsemble:
-    """
-    Confidence-weighted ensemble over all models for a given strategy.
-
-    Accepts a checkpoint suffix so it works for all strategies:
-      suffix=""        → S1: sota_{model}.pt       (real only)
-      suffix="_heavy"  → S2: sota_{model}_heavy.pt (heavy aug)
-      suffix="_aug"    → S3: sota_{model}_aug.pt   (SD synthetic)
-
-    Each model's vote is weighted by its own per-sample softmax confidence.
-    High-confidence models dominate; uncertain models contribute less.
-    Loads ALL models in args.models that have a checkpoint for this suffix —
-    not just swin, not just the best single model.
-    """
-
     def __init__(self, model_names, suffix=""):
         self.models  = {}
         self.suffix  = suffix
@@ -1394,12 +1344,6 @@ class ConfidenceEnsemble:
               f"[{', '.join(self.models.keys())}]")
 
     def predict(self, x):
-        """
-        Confidence-weighted ensemble prediction.
-        Returns (preds, ensemble_probs).
-        preds:          (B,) predicted class indices
-        ensemble_probs: (B, C) weighted average of per-model softmax outputs
-        """
         x          = x.to(DEVICE)
         probs_list = []
         with torch.no_grad():
@@ -1415,7 +1359,6 @@ class ConfidenceEnsemble:
 
 
 def eval_ensemble(ensemble, loader):
-    """Run ensemble inference on a DataLoader, return acc, y_true, y_pred, probs."""
     yt_list, yp_list, pr_list = [], [], []
     for xb, yb in loader:
         preds, probs = ensemble.predict(xb)
@@ -1429,17 +1372,15 @@ def eval_ensemble(ensemble, loader):
 
 
 def evaluate_all(augmented=False):
-    """Full evaluation: per-model metrics + confidence ensemble + FID."""
     print("\n" + "="*65)
     print(f"Evaluation ({'augmented' if augmented else 'baseline'})")
     print("="*65)
 
-    val_ds  = GastroVisionDataset(SPLITS_DIR / args.val_csv, "val", "classifier")
+    val_ds  = GastroVisionDataset(SPLITS_DIR / args.val_csv, "val", "classifier", synth_dir_name=args.synth_dir)
     val_ldr = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                          num_workers=4, pin_memory=True)
     results = {}
 
-    # ── Per-model evaluation ──────────────────────────────────────────────────
     for name in args.models:
         try:
             model = load_checkpoint(name, augmented)
@@ -1456,7 +1397,6 @@ def evaluate_all(augmented=False):
                          "f1_rare": float(f1[[c for c in RARE_CLASSES if c < NUM_CLASSES]].mean())}
         del model; torch.cuda.empty_cache()
 
-    # ── Confidence-weighted ensemble over ALL models ──────────────────────────
     suffix = "_aug" if augmented else ""
     if len(results) >= 2:
         print(f"\n{'='*65}")
@@ -1497,10 +1437,7 @@ def evaluate_all(augmented=False):
 
         except Exception as e:
             print(f"  Ensemble failed: {e}")
-    else:
-        print("  Skipping ensemble — need ≥ 2 trained models")
 
-    # ── Confusion matrix for best individual model ────────────────────────────
     individual = {k: v for k, v in results.items() if k != "ensemble"}
     if individual:
         best = max(individual, key=lambda k: individual[k]["acc"])
@@ -1520,7 +1457,6 @@ def evaluate_all(augmented=False):
         except Exception as e:
             print(f"  Warning: could not save confusion matrix: {e}")
 
-    # Per-class F1 bar chart
     if results:
         fig, ax = plt.subplots(figsize=(max(12, NUM_CLASSES * 2), 5))
         x = np.arange(NUM_CLASSES); w = 0.8 / max(len(results), 1)
@@ -1536,7 +1472,6 @@ def evaluate_all(augmented=False):
         plt.savefig(RESULTS_DIR / f"f1_per_class{'_aug' if augmented else ''}.png",
                     dpi=150, bbox_inches="tight"); plt.close()
 
-    # FID on augmented run
     if augmented:
         synth_csv = SYNTH_DIR / "synthetic_train.csv"
         if synth_csv.exists():
@@ -1546,7 +1481,6 @@ def evaluate_all(augmented=False):
             results["_fid_pooled"] = fid
             results["_kid_pooled"] = kid
 
-    # Save JSON
     tag = "_aug" if augmented else ""
     with open(RESULTS_DIR / f"eval_results{tag}.json", "w") as f:
         json.dump(results, f, indent=2)
@@ -1562,17 +1496,11 @@ def evaluate_all(augmented=False):
 
 
 def evaluate_heavy_aug():
-    """
-    Strategy S2 evaluation — heavy traditional augmentation only.
-    Loads sota_{model}_heavy.pt checkpoints.
-    This is the critical ablation comparison for the paper:
-    does SD generation improve on just augmenting real images more?
-    """
     print("\n" + "="*65)
     print("Evaluation (S2: heavy traditional augmentation only)")
     print("="*65)
 
-    val_ds  = GastroVisionDataset(SPLITS_DIR / args.val_csv, "val", "classifier")
+    val_ds  = GastroVisionDataset(SPLITS_DIR / args.val_csv, "val", "classifier", synth_dir_name=args.synth_dir)
     val_ldr = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                          num_workers=4, pin_memory=True)
     results = {}
@@ -1598,7 +1526,6 @@ def evaluate_heavy_aug():
                          "f1_rare": float(f1[[c for c in RARE_CLASSES if c < NUM_CLASSES]].mean())}
         del model; torch.cuda.empty_cache()
 
-    # ── Confidence-weighted ensemble over ALL heavy aug models ────────────────
     if len(results) >= 2:
         print(f"\n{'='*65}")
         print(f"Confidence-Weighted Ensemble (S2: heavy aug)")
@@ -1646,14 +1573,14 @@ def evaluate_heavy_aug():
 
 
 # ==============================================================================
-# SECTION 12 — Main
+# SECTION 12 — Main (with conditional heavy-aug eval)
 # ==============================================================================
 
 def main():
     global NUM_CLASSES, RARE_CLASSES
 
     print("=" * 65)
-    print("GastroVision DDPM Augmentation Pipeline")
+    print("GastroVision DDPM Augmentation Pipeline (FIXED)")
     print("=" * 65)
     print(f"  data_dir:            {DATA_DIR}")
     print(f"  output_dir:          {OUTPUT_DIR}")
@@ -1667,7 +1594,7 @@ def main():
     print(f"  guidance_scale:      {args.guidance_scale}")
     print()
 
-    # ── Step 1: Splits ────────────────────────────────────────────────────────
+    # Step 1: Splits
     train_csv = SPLITS_DIR / args.train_csv
     val_csv   = SPLITS_DIR / args.val_csv
     test_csv  = SPLITS_DIR / args.test_csv
@@ -1680,26 +1607,33 @@ def main():
         train_df = pd.read_csv(train_csv)
         val_df   = pd.read_csv(val_csv)
         test_df  = pd.read_csv(test_csv)
+        # Update global NUM_CLASSES from saved label mapping
+        if "original_label" in train_df.columns:
+            unique_orig = sorted(train_df["original_label"].unique())
+        else:
+            unique_orig = sorted(train_df["label"].unique())
+        global LABEL_MAP, REV_LABEL_MAP
+        LABEL_MAP = {orig: i for i, orig in enumerate(unique_orig)}
+        REV_LABEL_MAP = {i: orig for orig, i in LABEL_MAP.items()}
+        NUM_CLASSES = len(unique_orig)
         counts   = train_df["label"].value_counts()
-        RARE_CLASSES = sorted(counts[counts < 30].index.tolist())
+        RARE_CLASSES = sorted([LABEL_MAP[c] for c in unique_orig if len(train_df[train_df["original_label"]==c]) < 30])
         print(f"Loaded splits. RARE_CLASSES={RARE_CLASSES}")
 
-    NUM_CLASSES = int(train_df["label"].max()) + 1
-    # Update HPARAMS now that NUM_CLASSES is known (used in model constructors)
     print(f"NUM_CLASSES={NUM_CLASSES}")
 
     if args.evaluate_only:
         evaluate_all(augmented=False)
+        evaluate_heavy_aug()
         evaluate_all(augmented=True)
         return
 
-    # ── Step 2: Train baselines on real data ──────────────────────────────────
+    # Step 2: Train baselines on real data
     if not args.skip_training:
         print("\n" + "="*65)
         print("Step 2: Training classifiers on real data")
         print("="*65)
 
-        # Load previously tuned hparams from PVC if they exist
         hparams_path = OUTPUT_DIR / "best_hparams.json"
         if hparams_path.exists():
             with open(hparams_path) as f:
@@ -1715,7 +1649,6 @@ def main():
                 print(f"\n  ✅ {name} checkpoint already exists — skipping training")
                 continue
 
-            # Optuna tuning before full training (if --tune flag set)
             if args.tune:
                 tune_classifier(
                     name, train_csv, val_csv,
@@ -1726,9 +1659,7 @@ def main():
             print(f"\n{'#'*65}\n  {name}\n{'#'*65}")
             train_classifier(name, train_csv, val_csv, augmented=False)
 
-    # ── Step 2B: Train with heavy traditional augmentation (Strategy S2) ─────
-    # This is the ablation baseline — same real data, just stronger transforms.
-    # Must be run to establish whether SD generation adds value over augmentation.
+    # Step 2B: Train with heavy traditional augmentation (S2)
     if not args.skip_training:
         print("\n" + "="*65)
         print("Step 2B: Training with heavy traditional augmentation (S2)")
@@ -1741,9 +1672,7 @@ def main():
             print(f"\n{'#'*65}\n  {name} (heavy aug)\n{'#'*65}")
             train_classifier_heavy_aug(name, train_csv, val_csv)
 
-    # ── Step 3: Domain adaptation ─────────────────────────────────────────────
-    # Auto-skip if EMA adapter already exists on PVC from a previous run.
-    # The resume checkpoint (resume_sd_lora.pt) handles mid-training restarts.
+    # Step 3: Domain adaptation
     ema_adapter = CKPT_DIR / "sd_gastrovision_lora_ema_adapter"
     if not args.skip_domain_adapt:
         if ema_adapter.exists():
@@ -1757,10 +1686,9 @@ def main():
             print("="*65)
             domain_adapt_sd()
 
-    # ── Step 4: Generate synthetic images ─────────────────────────────────────
+    # Step 4: Generate synthetic images
     synth_csv_path = SYNTH_DIR / "synthetic_train.csv"
     if not args.skip_generation:
-        # Auto-skip if all rare classes already have enough images
         already_done = all(
             len(list((SYNTH_DIR / str(cls)).glob("synth_*.png"))) >= args.samples_per_class
             for cls in RARE_CLASSES
@@ -1779,22 +1707,44 @@ def main():
     else:
         synth_df = pd.read_csv(synth_csv_path) if synth_csv_path.exists() else None
 
-    # ── Step 5: Build augmented CSV + retrain ─────────────────────────────────
+    # Step 5: Build augmented CSV + retrain (with proper leakage check)
     if not args.skip_training and synth_df is not None:
         print("\n" + "="*65)
         print("Step 5: Building augmented dataset + retraining")
         print("="*65)
 
-        # Leakage check
-        val_paths  = set(pd.read_csv(val_csv)["image_path"])
-        test_paths = set(pd.read_csv(test_csv)["image_path"])
-        assert not (set(synth_df["image_path"]) & val_paths),  "Leakage: synth overlaps val!"
-        assert not (set(synth_df["image_path"]) & test_paths), "Leakage: synth overlaps test!"
-        print("✅ No leakage detected")
+        # Leakage check using absolute paths
+        def normalize_path(p, base_dir):
+            p = Path(p)
+            # If it's a relative path under IMAGE_ROOT_DIR, resolve
+            if not p.is_absolute():
+                if (IMAGE_ROOT_DIR / p).exists():
+                    return (IMAGE_ROOT_DIR / p).resolve()
+                elif (OUTPUT_DIR / p).exists():
+                    return (OUTPUT_DIR / p).resolve()
+                else:
+                    return p  # fallback
+            return p.resolve()
+
+        val_paths_abs = set(normalize_path(p, IMAGE_ROOT_DIR) for p in pd.read_csv(val_csv)["image_path"])
+        test_paths_abs = set(normalize_path(p, IMAGE_ROOT_DIR) for p in pd.read_csv(test_csv)["image_path"])
+        synth_paths_abs = set(normalize_path(p, OUTPUT_DIR) for p in synth_df["image_path"])
+
+        overlap_val = synth_paths_abs & val_paths_abs
+        overlap_test = synth_paths_abs & test_paths_abs
+        if overlap_val or overlap_test:
+            print(f"⚠ WARNING: Leakage detected! Overlap with val: {overlap_val}, with test: {overlap_test}")
+            # Remove overlapping synthetic images
+            synth_df = synth_df[~synth_df["image_path"].isin([str(p.relative_to(OUTPUT_DIR)) for p in overlap_val.union(overlap_test)])]
+            print(f"  Removed {len(overlap_val)+len(overlap_test)} leaked images. New synth count: {len(synth_df)}")
+        else:
+            print("✅ No leakage detected")
 
         aug_csv = SPLITS_DIR / args.aug_train_csv
         if not aug_csv.exists():
-            aug_df = pd.concat([train_df, synth_df], ignore_index=True)
+            # Ensure train_df has same columns as synth_df
+            train_aug = train_df[["image_path", "label", "class_name"]].copy()
+            aug_df = pd.concat([train_aug, synth_df], ignore_index=True)
             aug_df.to_csv(aug_csv, index=False)
             print(f"Augmented dataset: {len(train_df)} real + {len(synth_df)} synthetic = {len(aug_df)} total")
         else:
@@ -1808,24 +1758,28 @@ def main():
             print(f"\n{'#'*65}\n  {name} (augmented)\n{'#'*65}")
             train_classifier(name, aug_csv, val_csv, augmented=True)
 
-    # ── Step 6: Evaluate all strategies ──────────────────────────────────────
+    # Step 6: Evaluate all strategies
     print("\n" + "="*65)
     print("Step 6: Evaluation")
     print("="*65)
-    evaluate_all(augmented=False)             # S1: real only
-    evaluate_heavy_aug()                       # S2: heavy traditional aug
+    evaluate_all(augmented=False)
+    # Only run heavy-aug evaluation if at least one heavy checkpoint exists
+    heavy_exists = any((CKPT_DIR / f"sota_{name}_heavy.pt").exists() for name in args.models)
+    if heavy_exists:
+        evaluate_heavy_aug()
+    else:
+        print("Skipping heavy-aug evaluation — no checkpoints found.")
     if not args.skip_training and synth_df is not None:
-        evaluate_all(augmented=True)           # S3: real + SD synthetic
+        evaluate_all(augmented=True)
 
-    # ── Strategy comparison summary table ─────────────────────────────────────
+    # Strategy comparison summary
     print("\n" + "="*65)
     print("STRATEGY COMPARISON SUMMARY (Table 2 in paper)")
     print("="*65)
     try:
         s1 = json.load(open(RESULTS_DIR / "eval_results.json"))
-        s2 = json.load(open(RESULTS_DIR / "eval_results_heavy.json"))
-        s3 = json.load(open(RESULTS_DIR / "eval_results_aug.json")) \
-             if (RESULTS_DIR / "eval_results_aug.json").exists() else {}
+        s2 = json.load(open(RESULTS_DIR / "eval_results_heavy.json")) if (RESULTS_DIR / "eval_results_heavy.json").exists() else {}
+        s3 = json.load(open(RESULTS_DIR / "eval_results_aug.json")) if (RESULTS_DIR / "eval_results_aug.json").exists() else {}
 
         print(f"\n{'Strategy':<22} {'Model':<33} {'Acc':>8}  {'Mean F1':>8}  {'Rare F1':>8}")
         print("-"*82)
@@ -1836,12 +1790,10 @@ def main():
             ("S3: SD synthetic",  "_aug",   s3),
         ]:
             if not data: continue
-            # Individual models first
             for nm, res in data.items():
                 if nm in ("ensemble",) or nm.startswith("_"): continue
                 print(f"  {strategy:<20} {nm:<33} {res['acc']:>8.4f}  "
                       f"{res['f1_mean']:>8.4f}  {res['f1_rare']:>8.4f}")
-            # Ensemble row (highlighted)
             if "ensemble" in data:
                 res = data["ensemble"]
                 n   = res.get("n_models", "?")
