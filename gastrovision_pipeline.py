@@ -1608,71 +1608,48 @@ def main():
         val_df   = pd.read_csv(val_csv)
         test_df  = pd.read_csv(test_csv)
 
-        # Determine unique original labels (or fall back to 'label' column)
+        # Determine original labels (if 'original_label' exists, otherwise use 'label')
         if "original_label" in train_df.columns:
-            unique_orig = sorted(train_df["original_label"].unique())
-            rare_orig = [c for c in unique_orig if len(train_df[train_df["original_label"] == c]) < 30]
+            original_labels = sorted(train_df["original_label"].unique())
+            rare_orig = [c for c in original_labels if len(train_df[train_df["original_label"] == c]) < 30]
         else:
-            # Assume the saved 'label' column already uses contiguous indices.
-            unique_orig = sorted(train_df["label"].unique())
-            rare_orig = [c for c in unique_orig if len(train_df[train_df["label"] == c]) < 30]
+            # Fallback: assume 'label' column contains original (non-contiguous) values
+            original_labels = sorted(train_df["label"].unique())
+            rare_orig = [c for c in original_labels if len(train_df[train_df["label"] == c]) < 30]
 
-        # Build mapping from original label to contiguous index
-        global LABEL_MAP, REV_LABEL_MAP
-        LABEL_MAP = {orig: i for i, orig in enumerate(unique_orig)}
+        # Create contiguous mapping
+        LABEL_MAP = {orig: i for i, orig in enumerate(original_labels)}
         REV_LABEL_MAP = {i: orig for orig, i in LABEL_MAP.items()}
-        NUM_CLASSES = len(unique_orig)
+        NUM_CLASSES = len(original_labels)
 
-        # Map rare original labels to contiguous indices
+        # Remap 'label' column to contiguous indices (if not already)
+        need_remap = False
+        if "original_label" in train_df.columns:
+            # Use original_label to remap
+            train_df["label"] = train_df["original_label"].map(LABEL_MAP)
+            val_df["label"]   = val_df["original_label"].map(LABEL_MAP)
+            test_df["label"]  = test_df["original_label"].map(LABEL_MAP)
+            need_remap = True
+        else:
+            # Check if current label values are already contiguous
+            current_labels = sorted(train_df["label"].unique())
+            if current_labels != list(range(NUM_CLASSES)):
+                train_df["label"] = train_df["label"].map(LABEL_MAP)
+                val_df["label"]   = val_df["label"].map(LABEL_MAP)
+                test_df["label"]  = test_df["label"].map(LABEL_MAP)
+                need_remap = True
+
+        # If remapping was performed, save the corrected CSVs for future runs
+        if need_remap:
+            train_df.to_csv(train_csv, index=False)
+            val_df.to_csv(val_csv, index=False)
+            test_df.to_csv(test_csv, index=False)
+            print("Remapped label columns to contiguous indices and saved CSV files.")
+
+        # Rare classes (contiguous indices)
         RARE_CLASSES = sorted([LABEL_MAP[c] for c in rare_orig])
 
         print(f"Loaded splits. RARE_CLASSES={RARE_CLASSES}")
-
-
-
-
-    # global NUM_CLASSES, RARE_CLASSES
-
-    # print("=" * 65)
-    # print("GastroVision DDPM Augmentation Pipeline (FIXED)")
-    # print("=" * 65)
-    # print(f"  data_dir:            {DATA_DIR}")
-    # print(f"  output_dir:          {OUTPUT_DIR}")
-    # print(f"  models:              {args.models}")
-    # print(f"  freeze_epochs:       {args.freeze_epochs}")
-    # print(f"  fine_tune_epochs:    {args.fine_tune_epochs}")
-    # print(f"  lora_rank:           {args.lora_rank}")
-    # print(f"  domain_adapt_steps:  {args.domain_adapt_steps}")
-    # print(f"  samples_per_class:   {args.samples_per_class}")
-    # print(f"  gen_steps:           {args.gen_steps}")
-    # print(f"  guidance_scale:      {args.guidance_scale}")
-    # print()
-
-    # # Step 1: Splits
-    # train_csv = SPLITS_DIR / args.train_csv
-    # val_csv   = SPLITS_DIR / args.val_csv
-    # test_csv  = SPLITS_DIR / args.test_csv
-
-    # if not train_csv.exists():
-    #     print("Creating splits...")
-    #     train_df, val_df, test_df, rare = create_splits()
-    #     RARE_CLASSES = rare
-    # else:
-    #     train_df = pd.read_csv(train_csv)
-    #     val_df   = pd.read_csv(val_csv)
-    #     test_df  = pd.read_csv(test_csv)
-    #     # Update global NUM_CLASSES from saved label mapping
-    #     if "original_label" in train_df.columns:
-    #         unique_orig = sorted(train_df["original_label"].unique())
-    #     else:
-    #         unique_orig = sorted(train_df["label"].unique())
-    #     global LABEL_MAP, REV_LABEL_MAP
-    #     LABEL_MAP = {orig: i for i, orig in enumerate(unique_orig)}
-    #     REV_LABEL_MAP = {i: orig for orig, i in LABEL_MAP.items()}
-    #     NUM_CLASSES = len(unique_orig)
-    #     counts   = train_df["label"].value_counts()
-    #     RARE_CLASSES = sorted([LABEL_MAP[c] for c in unique_orig if len(train_df[train_df["original_label"]==c]) < 30])
-    #     print(f"Loaded splits. RARE_CLASSES={RARE_CLASSES}")
 
     print(f"NUM_CLASSES={NUM_CLASSES}")
 
@@ -1770,14 +1747,13 @@ def main():
         # Leakage check using absolute paths
         def normalize_path(p, base_dir):
             p = Path(p)
-            # If it's a relative path under IMAGE_ROOT_DIR, resolve
             if not p.is_absolute():
                 if (IMAGE_ROOT_DIR / p).exists():
                     return (IMAGE_ROOT_DIR / p).resolve()
                 elif (OUTPUT_DIR / p).exists():
                     return (OUTPUT_DIR / p).resolve()
                 else:
-                    return p  # fallback
+                    return p
             return p.resolve()
 
         val_paths_abs = set(normalize_path(p, IMAGE_ROOT_DIR) for p in pd.read_csv(val_csv)["image_path"])
@@ -1788,7 +1764,6 @@ def main():
         overlap_test = synth_paths_abs & test_paths_abs
         if overlap_val or overlap_test:
             print(f"⚠ WARNING: Leakage detected! Overlap with val: {overlap_val}, with test: {overlap_test}")
-            # Remove overlapping synthetic images
             synth_df = synth_df[~synth_df["image_path"].isin([str(p.relative_to(OUTPUT_DIR)) for p in overlap_val.union(overlap_test)])]
             print(f"  Removed {len(overlap_val)+len(overlap_test)} leaked images. New synth count: {len(synth_df)}")
         else:
@@ -1796,7 +1771,6 @@ def main():
 
         aug_csv = SPLITS_DIR / args.aug_train_csv
         if not aug_csv.exists():
-            # Ensure train_df has same columns as synth_df
             train_aug = train_df[["image_path", "label", "class_name"]].copy()
             aug_df = pd.concat([train_aug, synth_df], ignore_index=True)
             aug_df.to_csv(aug_csv, index=False)
@@ -1817,7 +1791,6 @@ def main():
     print("Step 6: Evaluation")
     print("="*65)
     evaluate_all(augmented=False)
-    # Only run heavy-aug evaluation if at least one heavy checkpoint exists
     heavy_exists = any((CKPT_DIR / f"sota_{name}_heavy.pt").exists() for name in args.models)
     if heavy_exists:
         evaluate_heavy_aug()
