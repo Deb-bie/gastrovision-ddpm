@@ -651,13 +651,36 @@ def get_model(name):
         raise ValueError(f"Unknown model '{name}'. Choose from {list(MODEL_REGISTRY.keys())}")
     return MODEL_REGISTRY[name](NUM_CLASSES).to(DEVICE)
 
+# def load_checkpoint(model_name, augmented=False):
+#     suffix = "_aug" if augmented else ""
+#     path   = CKPT_DIR / f"sota_{model_name}{suffix}.pt"
+#     if not path.exists():
+#         raise FileNotFoundError(f"Checkpoint not found: {path}")
+#     model = get_model(model_name)
+#     model.load_state_dict(torch.load(path, map_location=DEVICE))
+#     model.eval()
+#     print(f"Loaded {model_name} from {path}")
+#     return model
+
+
+
 def load_checkpoint(model_name, augmented=False):
+    global NUM_CLASSES
     suffix = "_aug" if augmented else ""
     path   = CKPT_DIR / f"sota_{model_name}{suffix}.pt"
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
+    
+    # Infer NUM_CLASSES from the saved weights directly
+    state = torch.load(path, map_location=DEVICE)
+    for key in state:
+        if "classifier" in key and "weight" in key:
+            NUM_CLASSES = state[key].shape[0]
+            print(f"  Inferred NUM_CLASSES={NUM_CLASSES} from checkpoint")
+            break
+    
     model = get_model(model_name)
-    model.load_state_dict(torch.load(path, map_location=DEVICE))
+    model.load_state_dict(state)
     model.eval()
     print(f"Loaded {model_name} from {path}")
     return model
@@ -756,6 +779,9 @@ def train_classifier(model_name, train_csv, val_csv, augmented=False):
         if acc > best_acc:
             best_acc = acc
             torch.save(model.state_dict(), ckpt)
+            with open(ckpt.with_suffix(".meta.json"), "w") as f:
+                json.dump({"num_classes": NUM_CLASSES}, f)
+
             print(f"  ✅ Saved (val_acc={best_acc:.4f})")
 
     print(f"\n  ★ {model_name} best val_acc: {best_acc:.4f}")
@@ -920,6 +946,9 @@ def train_classifier_heavy_aug(model_name, train_csv, val_csv):
         if acc > best_acc:
             best_acc = acc
             torch.save(model.state_dict(), ckpt)
+            with open(ckpt.with_suffix(".meta.json"), "w") as f:
+                json.dump({"num_classes": NUM_CLASSES}, f)
+
             print(f"  ✅ Saved (val_acc={best_acc:.4f})")
 
     print(f"\n  ★ {model_name} heavy aug best val_acc: {best_acc:.4f}")
@@ -1104,6 +1133,7 @@ def domain_adapt_sd():
             print(f"  Checkpoint at step {step}")
 
     torch.save(unet.state_dict(), CKPT_DIR / "sd_gastrovision_lora.pt")
+
     unet.save_pretrained(CKPT_DIR / "sd_gastrovision_lora_adapter")
     ema.save_adapter(unet, CKPT_DIR / "sd_gastrovision_lora_ema_adapter")
 
@@ -1610,7 +1640,12 @@ def main():
 
         # Determine original labels (if 'original_label' exists, otherwise use 'label')
         if "original_label" in train_df.columns:
-            original_labels = sorted(train_df["original_label"].unique())
+            # original_labels = sorted(train_df["original_label"].unique())
+            original_labels = sorted(
+                set(train_df["original_label"].unique())
+                | set(val_df["original_label"].unique())
+                | set(test_df["original_label"].unique())
+            )
             rare_orig = [c for c in original_labels if len(train_df[train_df["original_label"] == c]) < 30]
         else:
             # Fallback: assume 'label' column contains original (non-contiguous) values
