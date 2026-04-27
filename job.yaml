@@ -12,10 +12,9 @@ spec:
       restartPolicy: OnFailure
       affinity:
         nodeAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            preference:
-              matchExpressions:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
@@ -24,9 +23,26 @@ spec:
                 - NVIDIA-RTX-A6000
                 - NVIDIA-GeForce-RTX-3090
                 - NVIDIA-GeForce-RTX-2080-Ti
+
+      # affinity:
+      #   nodeAffinity:
+      #     preferredDuringSchedulingIgnoredDuringExecution:
+      #     - weight: 100
+      #       preference:
+      #         matchExpressions:
+      #         - key: nvidia.com/gpu.product
+      #           operator: In
+      #           values:
+      #           - NVIDIA-A100-SXM4-40GB
+      #           - NVIDIA-A100-SXM4-80GB
+      #           - NVIDIA-RTX-A6000
+      #           - NVIDIA-GeForce-RTX-3090
+      #           - NVIDIA-GeForce-RTX-2080-Ti
       containers:
       - name: gastro-pipeline
+        # image: pytorch/pytorch:2.1.0-cuda12.4-cudnn8-runtime
         image: nvcr.io/nvidia/pytorch:23.10-py3
+        # image: pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime
         imagePullPolicy: IfNotPresent
 
         env:
@@ -37,6 +53,7 @@ spec:
         - "bash"
         - "-c"
         - |
+          set -e
           echo "=== Checking GPU ==="
           nvidia-smi
  
@@ -55,8 +72,10 @@ spec:
           # Remove ALL opencv variants — including the one baked into the base image
           pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python \
             opencv-contrib-python-headless 2>/dev/null || true
-          # Remove pre-installed packages that conflict with our pinned versions
-          pip uninstall -y shap diffusers transformers huggingface_hub 2>/dev/null || true
+          # Remove pre-installed packages that conflict with our pinned versions.
+          # timm: base image has older version, HybridV2 needs features_only API from >=0.9
+          # optuna: base image may have older version incompatible with TPESampler API
+          pip uninstall -y shap diffusers transformers huggingface_hub timm optuna 2>/dev/null || true
           # Install pinned opencv first so everything that depends on cv2 gets the right version
           pip install -q opencv-python-headless==4.8.1.78
           pip install -q -r requirements.txt
@@ -79,8 +98,18 @@ spec:
             --guidance_scale      7.0                              \
             --gen_batch_size      1                                \
             --models efficientnetv2_rw_s swin mobile hybrid_cnn_transformer_v2
+            # ── Optional flags (uncomment to enable) ─────────────────────────
+            # --tune                   # Optuna hyperparameter search before training
+            # --tune_trials 15         # number of Optuna trials per model (default 15)
+            # --tune_epochs 8          # epochs per trial (default 8)
+            # --skip_domain_adapt      # skip if EMA adapter already on PVC
+            # --skip_generation        # skip if synthetic images already on PVC
+            # --skip_training          # skip all classifier training
+            # --evaluate_only          # only run evaluation on existing checkpoints
 
         volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
         - name: git-volume
           mountPath: /opt/repo
         - name: gastro-data-volume
@@ -88,7 +117,7 @@ spec:
 
         resources:
           limits:
-            memory: 32Gi
+            memory: 40Gi
             cpu: "8"
             nvidia.com/gpu: "1"
             ephemeral-storage: 50Gi
@@ -99,6 +128,10 @@ spec:
             ephemeral-storage: 20Gi
 
       volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
       - name: git-volume
         emptyDir: {}
       - name: gastro-data-volume
