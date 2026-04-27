@@ -895,10 +895,22 @@ def train_classifier_heavy_aug(model_name, train_csv, val_csv):
 
     train_ds = HeavyAugDataset(train_csv, "train")
     val_ds   = GastroVisionDataset(val_csv, "val", "classifier", synth_dir_name=args.synth_dir)
-    tl = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
-                    num_workers=4, pin_memory=True)
-    vl = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
-                    num_workers=4, pin_memory=True)
+    tl = DataLoader(
+        train_ds, 
+        batch_size=cfg["batch_size"], 
+        shuffle=True,
+        num_workers=2, 
+        pin_memory=True, 
+        persistent_workers=True
+    )
+    vl = DataLoader(
+        val_ds,
+        batch_size=cfg["batch_size"], 
+        shuffle=False,
+        num_workers=2, 
+        pin_memory=True,
+        persistent_workers=True
+    )
 
     # Phase 1
     _freeze(model, model_name)
